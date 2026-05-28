@@ -1,0 +1,309 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="default" />
+  <meta name="apple-mobile-web-app-title" content="Folio" />
+  <meta name="theme-color" content="#8B5E3C" />
+  <title>Folio – EPUB Reader</title>
+  <link rel="manifest" href="manifest.json" />
+  <!-- Apple touch icon fallback (inline SVG as data URI) -->
+  <link rel="apple-touch-icon" href="icon-192.png" />
+
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    html, body, #root {
+      height: 100%;
+      height: -webkit-fill-available;
+      overscroll-behavior: none;
+    }
+    body { -webkit-text-size-adjust: 100%; }
+    /* Chapter content styles */
+    .chapter-content h1, .chapter-content h2, .chapter-content h3 {
+      margin: 1.4em 0 0.6em;
+      line-height: 1.3;
+    }
+    .chapter-content p { margin: 0 0 1em; }
+    .chapter-content img { max-width: 100%; height: auto; display: block; margin: 1em auto; border-radius: 4px; }
+    .chapter-content a { color: inherit; text-decoration: underline; opacity: 0.7; }
+    .chapter-content blockquote {
+      border-left: 3px solid currentColor;
+      margin: 1em 0;
+      padding-left: 1em;
+      opacity: 0.75;
+    }
+    .chapter-content table { width: 100%; border-collapse: collapse; margin: 1em 0; font-size: 0.9em; }
+    .chapter-content td, .chapter-content th { border: 1px solid rgba(0,0,0,0.15); padding: 6px 10px; }
+  </style>
+</head>
+<body>
+<div id="root"></div>
+
+<script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin></script>
+<script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+
+<script type="text/babel">
+const { useState, useEffect, useRef, useCallback } = React;
+
+const FONT_SIZES = [14, 16, 18, 20, 24];
+const THEMES = {
+  light: { bg: '#FAF7F2', text: '#2C2416', surface: '#F0EBE1', accent: '#8B5E3C', border: '#DDD5C8' },
+  sepia: { bg: '#F4ECD8', text: '#3B2F1E', surface: '#EAE0CA', accent: '#7A5C38', border: '#D4C4A8' },
+  dark:  { bg: '#1A1814', text: '#E8E0D0', surface: '#252219', accent: '#C4956A', border: '#3A362E' },
+};
+
+// ── EPUB parsing helpers ────────────────────────────────────────────────────
+
+function qsAll(doc, localName) {
+  const direct = doc.querySelectorAll(localName);
+  if (direct.length > 0) return Array.from(direct);
+  return Array.from(doc.getElementsByTagNameNS('*', localName));
+}
+function qs(doc, localName) { return qsAll(doc, localName)[0] || null; }
+
+function getDcText(doc, name) {
+  const selectors = [`dc\\:${name}`, name, `metadata ${name}`];
+  for (const sel of selectors) {
+    try { const el = doc.querySelector(sel); if (el?.textContent) return el.textContent.trim(); } catch (_) {}
+  }
+  const els = doc.getElementsByTagNameNS('http://purl.org/dc/elements/1.1/', name);
+  return els.length > 0 ? els[0].textContent.trim() : null;
+}
+
+async function parseEpub(file) {
+  const arrayBuffer = await file.arrayBuffer();
+  const zip = new JSZip();
+  const epub = await zip.loadAsync(arrayBuffer);
+
+  const containerXml = await epub.file('META-INF/container.xml')?.async('text');
+  if (!containerXml) throw new Error('Invalid EPUB: no container.xml');
+
+  const parser = new DOMParser();
+  const opfPath = qs(parser.parseFromString(containerXml, 'application/xml'), 'rootfile')?.getAttribute('full-path');
+  if (!opfPath) throw new Error('Invalid EPUB: no OPF path');
+
+  const opfText = await epub.file(opfPath)?.async('text');
+  if (!opfText) throw new Error('Invalid EPUB: no OPF file');
+
+  const opfDoc = parser.parseFromString(opfText, 'application/xml');
+  const opfDir = opfPath.includes('/') ? opfPath.substring(0, opfPath.lastIndexOf('/') + 1) : '';
+
+  const manifest = {};
+  qsAll(opfDoc, 'item').forEach(item => {
+    manifest[item.getAttribute('id')] = { href: item.getAttribute('href'), mediaType: item.getAttribute('media-type') };
+  });
+
+  const spineEl = qs(opfDoc, 'spine');
+  const spineItems = [];
+  qsAll(opfDoc, 'itemref').forEach(ref => {
+    const id = ref.getAttribute('idref');
+    if (manifest[id]) spineItems.push({ id, ...manifest[id] });
+  });
+
+  // NCX TOC
+  let toc = [];
+  const ncxEntry = (spineEl?.getAttribute('toc') && manifest[spineEl.getAttribute('toc')]) ||
+    Object.values(manifest).find(m => m.mediaType === 'application/x-dtbncx+xml');
+  if (ncxEntry) {
+    const ncxFile = epub.file(opfDir + ncxEntry.href);
+    if (ncxFile) {
+      const ncxDoc = parser.parseFromString(await ncxFile.async('text'), 'application/xml');
+      Array.from(ncxDoc.getElementsByTagNameNS('*', 'navPoint')).forEach(np => {
+        const label = np.getElementsByTagNameNS('*', 'text')[0]?.textContent?.trim() || 'Chapter';
+        const src = np.getElementsByTagNameNS('*', 'content')[0]?.getAttribute('src') || '';
+        toc.push({ label, href: src.includes('#') ? src.split('#')[0] : src });
+      });
+    }
+  }
+
+  const title  = getDcText(opfDoc, 'title')   || file.name.replace(/\.epub$/i, '');
+  const author = getDcText(opfDoc, 'creator') || 'Unknown Author';
+
+  const chapters = [];
+  for (let i = 0; i < spineItems.length; i++) {
+    const item = spineItems[i];
+    const chapterFile = epub.file(opfDir + item.href);
+    if (!chapterFile) continue;
+    const html = await chapterFile.async('text');
+    const hrefBase = item.href.split('#')[0];
+    const tocEntry = toc.find(t => t.href.split('#')[0] === hrefBase);
+    chapters.push({ id: item.id, href: item.href, label: tocEntry?.label || `Section ${i + 1}`, html });
+  }
+
+  if (chapters.length === 0) throw new Error('No readable chapters found.');
+  return { title, author, chapters };
+}
+
+function sanitizeHtml(html) {
+  const doc = new DOMParser().parseFromString(html, 'text/html');
+  doc.querySelectorAll('script, style, link').forEach(el => el.remove());
+  return doc.body?.innerHTML || '';
+}
+
+// ── Persist reading position in localStorage ────────────────────────────────
+function savePosition(title, index) {
+  try { localStorage.setItem('folio_pos_' + btoa(title).slice(0,20), index); } catch(_) {}
+}
+function loadPosition(title) {
+  try { return parseInt(localStorage.getItem('folio_pos_' + btoa(title).slice(0,20))) || 0; } catch(_) { return 0; }
+}
+
+// ── App ──────────────────────────────────────────────────────────────────────
+function App() {
+  const [book, setBook]               = useState(null);
+  const [chapterIndex, setChapterIndex] = useState(0);
+  const [fontIdx, setFontIdx]         = useState(1);
+  const [theme, setTheme]             = useState(() => localStorage.getItem('folio_theme') || 'light');
+  const [showSidebar, setShowSidebar] = useState(false);
+  const [showSettings, setShowSettings] = useState(false);
+  const [loading, setLoading]         = useState(false);
+  const [error, setError]             = useState(null);
+  const contentRef = useRef(null);
+  const fileRef    = useRef(null);
+
+  const t  = THEMES[theme];
+  const fs = FONT_SIZES[fontIdx];
+  const progress = book ? Math.round(((chapterIndex + 1) / book.chapters.length) * 100) : 0;
+
+  // Persist theme
+  useEffect(() => { localStorage.setItem('folio_theme', theme); }, [theme]);
+
+  // Scroll to top on chapter change
+  useEffect(() => { contentRef.current?.scrollTo(0, 0); }, [chapterIndex]);
+
+  // Save reading position
+  useEffect(() => { if (book) savePosition(book.title, chapterIndex); }, [book, chapterIndex]);
+
+  const openFile = useCallback(async (file) => {
+    if (!file?.name.toLowerCase().endsWith('.epub')) { setError('Please choose a .epub file.'); return; }
+    setLoading(true); setError(null);
+    try {
+      const parsed = await parseEpub(file);
+      const savedPos = loadPosition(parsed.title);
+      setBook(parsed);
+      setChapterIndex(savedPos);
+    } catch(e) { setError('Could not open book: ' + e.message); }
+    finally { setLoading(false); }
+  }, []);
+
+  const chapter = book?.chapters[chapterIndex];
+
+  // ── styles (inline, theme-reactive) ───────────────────────────────────────
+  const S = {
+    app: { fontFamily: "Georgia, 'Times New Roman', serif", minHeight: '100dvh', background: t.bg, color: t.text, display: 'flex', flexDirection: 'column', transition: 'background .3s,color .3s' },
+    bar: { display: 'flex', alignItems: 'center', gap: 8, padding: '10px 14px', background: t.surface, borderBottom: `1px solid ${t.border}`, position: 'sticky', top: 0, zIndex: 100 },
+    iBtn: { background: 'none', border: 'none', cursor: 'pointer', color: t.accent, padding: 6, borderRadius: 8, fontSize: 22, lineHeight: 1, display:'flex', alignItems:'center', justifyContent:'center', minWidth: 36, minHeight: 36 },
+    prog: { height: 3, background: t.border },
+    progFill: { height: '100%', background: t.accent, width: progress + '%', transition: 'width .4s ease' },
+    content: { flex: 1, overflowY: 'auto', WebkitOverflowScrolling: 'touch', padding: '28px 20px 90px', maxWidth: 680, width: '100%', margin: '0 auto', fontSize: fs, lineHeight: 1.85, color: t.text },
+    bottomBar: { position: 'fixed', bottom: 0, left: 0, right: 0, display: 'flex', alignItems: 'center', gap: 8, padding: '10px 16px', paddingBottom: 'max(10px, env(safe-area-inset-bottom))', background: t.surface, borderTop: `1px solid ${t.border}`, zIndex: 100 },
+    navBtn: (off) => ({ background: off ? 'transparent' : t.accent, color: off ? t.accent : '#fff', border: `1px solid ${t.accent}`, borderRadius: 20, padding: '7px 18px', fontSize: 13, fontWeight: 600, cursor: off ? 'default' : 'pointer', opacity: off ? 0.35 : 1, fontFamily: 'inherit', transition: 'opacity .2s', whiteSpace: 'nowrap' }),
+    chLabel: { flex: 1, fontSize: 11, color: t.accent, textAlign: 'center', opacity: .75, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' },
+    overlay: { position: 'fixed', inset: 0, background: 'rgba(0,0,0,.45)', zIndex: 190, opacity: showSidebar ? 1 : 0, pointerEvents: showSidebar ? 'auto' : 'none', transition: 'opacity .25s' },
+    drawer: { position: 'fixed', top: 0, left: showSidebar ? 0 : -290, width: 270, height: '100%', background: t.surface, borderRight: `1px solid ${t.border}`, zIndex: 200, transition: 'left .28s ease', display: 'flex', flexDirection: 'column', overflowY: 'auto', WebkitOverflowScrolling: 'touch' },
+    drawerHead: { padding: '20px 16px 12px', borderBottom: `1px solid ${t.border}`, flexShrink: 0 },
+    tocRow: (a) => ({ padding: '11px 16px', cursor: 'pointer', fontSize: 13, borderLeft: a ? `3px solid ${t.accent}` : '3px solid transparent', background: a ? t.bg : 'transparent', color: a ? t.accent : t.text, fontWeight: a ? 600 : 400 }),
+    settBox: { position: 'fixed', top: 54, right: 10, background: t.surface, border: `1px solid ${t.border}`, borderRadius: 16, padding: 16, zIndex: 160, width: 210, boxShadow: '0 8px 32px rgba(0,0,0,.22)' },
+    setLabel: { fontSize: 10, fontWeight: 700, letterSpacing: '.1em', opacity: .45, textTransform: 'uppercase', marginBottom: 8 },
+    thCircle: (n) => ({ width: 30, height: 30, borderRadius: '50%', border: theme===n ? `2.5px solid ${t.accent}` : `2px solid ${t.border}`, background: THEMES[n].bg, cursor: 'pointer' }),
+    dropWrap: { flex: 1, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', padding: 32, gap: 16 },
+    dropBox: { border: `2px dashed ${t.accent}`, borderRadius: 24, padding: '36px 28px', cursor: 'pointer', width: '100%', maxWidth: 340, textAlign: 'center' },
+  };
+
+  return (
+    <div style={S.app} onDrop={e => { e.preventDefault(); openFile(e.dataTransfer.files[0]); }} onDragOver={e => e.preventDefault()}>
+
+      {/* ── Top bar ── */}
+      {book && (
+        <div style={S.bar}>
+          <button style={S.iBtn} onClick={() => setShowSidebar(true)} aria-label="Chapters">☰</button>
+          <div style={{ flex: 1, textAlign: 'center', fontSize: 13, fontWeight: 600, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', letterSpacing: '.02em' }}>{book.title}</div>
+          <button style={S.iBtn} onClick={() => setShowSettings(s => !s)} aria-label="Settings">⚙</button>
+        </div>
+      )}
+
+      {/* ── Progress bar ── */}
+      {book && <div style={S.prog}><div style={S.progFill} /></div>}
+
+      {/* ── Settings panel ── */}
+      {showSettings && book && (
+        <div style={S.settBox}>
+          <div style={S.setLabel}>Font Size</div>
+          <div style={{ display: 'flex', gap: 8, alignItems: 'center', marginBottom: 14 }}>
+            <button style={{ ...S.iBtn, border: `1px solid ${t.border}`, borderRadius: 8, padding: '3px 10px', fontSize: 14 }} onClick={() => setFontIdx(f => Math.max(0, f-1))}>A−</button>
+            <span style={{ flex: 1, textAlign: 'center', fontSize: 13 }}>{fs}px</span>
+            <button style={{ ...S.iBtn, border: `1px solid ${t.border}`, borderRadius: 8, padding: '3px 10px', fontSize: 14 }} onClick={() => setFontIdx(f => Math.min(FONT_SIZES.length-1, f+1))}>A+</button>
+          </div>
+          <div style={S.setLabel}>Theme</div>
+          <div style={{ display: 'flex', gap: 10, marginBottom: 14 }}>
+            {Object.keys(THEMES).map(n => <button key={n} style={S.thCircle(n)} onClick={() => setTheme(n)} title={n} />)}
+          </div>
+          <button style={{ ...S.navBtn(false), width: '100%', background: 'transparent', color: t.accent, marginTop: 4 }}
+            onClick={() => { setBook(null); setShowSettings(false); }}>Open New Book</button>
+        </div>
+      )}
+
+      {/* ── TOC drawer ── */}
+      <div style={S.overlay} onClick={() => setShowSidebar(false)} />
+      <div style={S.drawer}>
+        <div style={S.drawerHead}>
+          <div style={{ fontWeight: 700, fontSize: 14, marginBottom: 3 }}>{book?.title}</div>
+          <div style={{ fontSize: 12, opacity: .55 }}>{book?.author}</div>
+        </div>
+        {book?.chapters.map((ch, i) => (
+          <div key={ch.id} style={S.tocRow(i === chapterIndex)}
+            onClick={() => { setChapterIndex(i); setShowSidebar(false); }}>
+            {ch.label}
+          </div>
+        ))}
+      </div>
+
+      {/* ── Main area ── */}
+      {!book ? (
+        <div style={S.dropWrap}>
+          <div style={S.dropBox} onClick={() => fileRef.current?.click()}>
+            <div style={{ fontSize: 52, marginBottom: 12 }}>📖</div>
+            <div style={{ fontSize: 19, fontWeight: 700, marginBottom: 8 }}>Folio</div>
+            <div style={{ fontSize: 14, opacity: .55, lineHeight: 1.5 }}>Tap to open an EPUB, or drop one here</div>
+            {loading && <div style={{ marginTop: 14, color: t.accent, fontSize: 13 }}>Opening book…</div>}
+            {error   && <div style={{ marginTop: 10, color: '#d95555', fontSize: 13 }}>{error}</div>}
+          </div>
+          <input ref={fileRef} type="file" accept=".epub" style={{ display: 'none' }} onChange={e => openFile(e.target.files[0])} />
+          <div style={{ fontSize: 11, opacity: .35, textAlign: 'center' }}>Files stay on your device · Works offline</div>
+        </div>
+      ) : (
+        <>
+          <div ref={contentRef} className="chapter-content" style={S.content}
+            dangerouslySetInnerHTML={{ __html: sanitizeHtml(chapter?.html || '') }} />
+          <div style={S.bottomBar}>
+            <button style={S.navBtn(chapterIndex === 0)} disabled={chapterIndex === 0}
+              onClick={() => setChapterIndex(i => Math.max(0, i-1))}>← Prev</button>
+            <div style={S.chLabel}>{chapter?.label}</div>
+            <button style={S.navBtn(chapterIndex === book.chapters.length-1)} disabled={chapterIndex === book.chapters.length-1}
+              onClick={() => setChapterIndex(i => Math.min(book.chapters.length-1, i+1))}>Next →</button>
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+</script>
+
+<script>
+  // Register service worker for offline support
+  if ('serviceWorker' in navigator) {
+    window.addEventListener('load', () => {
+      navigator.serviceWorker.register('./sw.js')
+        .then(r => console.log('SW registered:', r.scope))
+        .catch(e => console.warn('SW failed:', e));
+    });
+  }
+</script>
+</body>
+</html>
