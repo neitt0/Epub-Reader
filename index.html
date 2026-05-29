@@ -33,9 +33,20 @@
 <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
 <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.min.js"></script>
 
 <script type="text/babel">
-const { useState, useEffect, useRef, useCallback } = React;
+const { useState, useEffect, useRef, useCallback, useMemo } = React;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// STEP 1: Paste your Supabase Project URL and Anon Key here
+// (see README / setup instructions below)
+// ─────────────────────────────────────────────────────────────────────────────
+const SUPABASE_URL      = 'https://equggcrzqijjvxgnfzlo.supabase.co';
+const SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImVxdWdnY3J6cWlqanZ4Z25memxvIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODAwNzYxNjUsImV4cCI6MjA5NTY1MjE2NX0.0jtp8Wn3IsnPViC8YSTRS9tF_80ZdBzJxVhjxXcMY4M';
+// ─────────────────────────────────────────────────────────────────────────────
+
+const IS_CONFIGURED = SUPABASE_URL !== 'YOUR_SUPABASE_URL';
 
 const FONT_SIZES = [14, 16, 18, 20, 24];
 const THEMES = {
@@ -44,66 +55,61 @@ const THEMES = {
   dark:  { bg:'#1A1814', text:'#E8E0D0', surface:'#252219', accent:'#C4956A', border:'#3A362E', card:'#2E2A24' },
 };
 
-// ── IndexedDB — stores raw EPUB bytes, NOT parsed HTML ───────────────────────
-// Storing bytes is ~10x smaller than parsed HTML and never hits storage limits.
-const DB_NAME = 'epubreader_v2', DB_VER = 1, STORE = 'books';
+// ── Supabase client (only if configured) ────────────────────────────────────
+const sb = IS_CONFIGURED ? supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY) : null;
+const BUCKET = 'epubs';
 
-let _db = null;
-function openDB() {
-  if (_db) return Promise.resolve(_db);
-  return new Promise((res, rej) => {
-    const req = indexedDB.open(DB_NAME, DB_VER);
-    req.onupgradeneeded = e => {
-      const db = e.target.result;
-      if (!db.objectStoreNames.contains(STORE)) {
-        db.createObjectStore(STORE, { keyPath: 'id' });
-      }
-    };
-    req.onsuccess = e => { _db = e.target.result; res(_db); };
-    req.onerror   = e => rej(e.target.error);
-  });
+// Each device gets a stable UUID stored in localStorage
+function getDeviceId() {
+  let id = localStorage.getItem('epub_device_id');
+  if (!id) {
+    id = 'dev_' + Date.now() + '_' + Math.random().toString(36).slice(2, 8);
+    localStorage.setItem('epub_device_id', id);
+  }
+  return id;
 }
 
-async function dbGetAll() {
-  const db = await openDB();
-  return new Promise((res, rej) => {
-    const req = db.transaction(STORE,'readonly').objectStore(STORE).getAll();
-    req.onsuccess = e => res(e.target.result);
-    req.onerror   = e => rej(e.target.error);
-  });
-}
-async function dbGet(id) {
-  const db = await openDB();
-  return new Promise((res, rej) => {
-    const req = db.transaction(STORE,'readonly').objectStore(STORE).get(id);
-    req.onsuccess = e => res(e.target.result);
-    req.onerror   = e => rej(e.target.error);
-  });
-}
-async function dbPut(record) {
-  const db = await openDB();
-  return new Promise((res, rej) => {
-    const req = db.transaction(STORE,'readwrite').objectStore(STORE).put(record);
-    req.onsuccess = e => res(e.target.result);
-    req.onerror   = e => rej(e.target.error);
-  });
-}
-async function dbDelete(id) {
-  const db = await openDB();
-  return new Promise((res, rej) => {
-    const req = db.transaction(STORE,'readwrite').objectStore(STORE).delete(id);
-    req.onsuccess = e => res(e.target.result);
-    req.onerror   = e => rej(e.target.error);
-  });
+// ── Supabase helpers ──────────────────────────────────────────────────────────
+async function sbGetLibrary() {
+  const { data, error } = await sb.from('books')
+    .select('id, title, author, file_path, created_at')
+    .eq('device_id', getDeviceId())
+    .order('created_at', { ascending: false });
+  if (error) throw error;
+  return data || [];
 }
 
-// Request persistent storage so the browser won't silently wipe it
-async function requestPersistentStorage() {
-  try {
-    if (navigator.storage?.persist) {
-      await navigator.storage.persist();
-    }
-  } catch(_) {}
+async function sbUploadBook(arrayBuffer, metadata) {
+  const deviceId = getDeviceId();
+  const bookId   = 'book_' + Date.now();
+  const filePath = `${deviceId}/${bookId}.epub`;
+
+  // 1. Upload file to Storage
+  const { error: upErr } = await sb.storage.from(BUCKET)
+    .upload(filePath, arrayBuffer, { contentType: 'application/epub+zip', upsert: false });
+  if (upErr) throw new Error('Upload failed: ' + upErr.message);
+
+  // 2. Save metadata to books table
+  const { error: dbErr } = await sb.from('books')
+    .insert({ id: bookId, device_id: deviceId, title: metadata.title, author: metadata.author, file_path: filePath });
+  if (dbErr) {
+    // Clean up orphaned file if DB insert fails
+    await sb.storage.from(BUCKET).remove([filePath]).catch(() => {});
+    throw new Error('Save failed: ' + dbErr.message);
+  }
+
+  return { id: bookId, file_path: filePath };
+}
+
+async function sbDownloadBook(filePath) {
+  const { data, error } = await sb.storage.from(BUCKET).download(filePath);
+  if (error) throw new Error('Download failed: ' + error.message);
+  return await data.arrayBuffer();
+}
+
+async function sbDeleteBook(id, filePath) {
+  await sb.storage.from(BUCKET).remove([filePath]);
+  await sb.from('books').delete().eq('id', id);
 }
 
 // ── EPUB parsing ──────────────────────────────────────────────────────────────
@@ -185,14 +191,54 @@ function sanitizeHtml(html) {
   return doc.body?.innerHTML || '';
 }
 
-function savePos(id, idx) {
-  try { localStorage.setItem('pos_' + id, idx); } catch(_) {}
-}
-function loadPos(id) {
-  try { return parseInt(localStorage.getItem('pos_' + id)) || 0; } catch(_) { return 0; }
+function savePos(id, idx) { try { localStorage.setItem('pos_'+id, idx); } catch(_) {} }
+function loadPos(id)      { try { return parseInt(localStorage.getItem('pos_'+id))||0; } catch(_) { return 0; } }
+
+// ── Setup screen ─────────────────────────────────────────────────────────────
+function SetupScreen({ t }) {
+  return (
+    <div style={{ flex:1, overflowY:'auto', padding:'32px 20px', maxWidth:560, margin:'0 auto', lineHeight:1.7 }}>
+      <div style={{ fontSize:28, marginBottom:4 }}>📖 EPUB Reader</div>
+      <div style={{ fontSize:14, opacity:.5, marginBottom:28 }}>One-time setup needed</div>
+
+      {[
+        { n:'1', title:'Go to supabase.com', body: 'Click "Start your project" and sign in with your GitHub account.' },
+        { n:'2', title:'Create a new project', body: 'Click "New project", give it any name (e.g. epub-reader), pick any region, and click "Create new project". Wait about 1 minute.' },
+        { n:'3', title:'Create the books table', body: 'In the left sidebar click "SQL Editor", paste the code below, and click "Run".' },
+        { n:'4', title:'Create the storage bucket', body: 'In the left sidebar click "Storage" → "New bucket". Name it epubs, check "Public bucket", click Save.' },
+        { n:'5', title:'Get your keys', body: 'In the left sidebar click "Project Settings" → "API". Copy the "Project URL" and the "anon public" key.' },
+        { n:'6', title:'Paste keys into index.html', body: 'Open index.html, find the two lines near the top that say YOUR_SUPABASE_URL and YOUR_SUPABASE_ANON_KEY, and replace them with your copied values. Upload to GitHub.' },
+      ].map(step => (
+        <div key={step.n} style={{ display:'flex', gap:14, marginBottom:20 }}>
+          <div style={{ width:28, height:28, borderRadius:'50%', background:t.accent, color:'#fff', display:'flex', alignItems:'center', justifyContent:'center', fontSize:13, fontWeight:700, flexShrink:0, marginTop:2 }}>{step.n}</div>
+          <div>
+            <div style={{ fontWeight:700, fontSize:15, marginBottom:3 }}>{step.title}</div>
+            <div style={{ fontSize:13, opacity:.65 }}>{step.body}</div>
+          </div>
+        </div>
+      ))}
+
+      <div style={{ background:t.card, borderRadius:12, padding:'14px 16px', marginTop:8, marginBottom:8 }}>
+        <div style={{ fontSize:11, fontWeight:700, letterSpacing:'.08em', opacity:.45, textTransform:'uppercase', marginBottom:8 }}>SQL to run in Step 3</div>
+        <pre style={{ fontSize:12, overflowX:'auto', lineHeight:1.6, color:t.text, opacity:.8 }}>{`create table books (
+  id text primary key,
+  device_id text not null,
+  title text,
+  author text,
+  file_path text,
+  created_at timestamptz default now()
+);
+alter table books disable row level security;`}</pre>
+      </div>
+
+      <div style={{ fontSize:12, opacity:.4, marginTop:16, textAlign:'center' }}>
+        Supabase free tier includes 1 GB file storage — enough for hundreds of books
+      </div>
+    </div>
+  );
 }
 
-// ── App ───────────────────────────────────────────────────────────────────────
+// ── Main App ──────────────────────────────────────────────────────────────────
 function App() {
   const [library, setLibrary]             = useState([]);
   const [book, setBook]                   = useState(null);
@@ -212,75 +258,66 @@ function App() {
   const fs = FONT_SIZES[fontIdx];
   const progress = book ? Math.round(((chapterIndex+1)/book.chapters.length)*100) : 0;
 
-  // On mount: request persistent storage + load library list
-  useEffect(() => {
-    requestPersistentStorage();
-    dbGetAll()
-      .then(rows => setLibrary(rows.map(r => ({ id: r.id, title: r.title, author: r.author }))))
-      .catch(() => setError('Could not load library. Try refreshing.'));
-  }, []);
-
   useEffect(() => { localStorage.setItem('epub_theme', theme); }, [theme]);
   useEffect(() => { contentRef.current?.scrollTo(0,0); }, [chapterIndex]);
   useEffect(() => { if (book) savePos(book.id, chapterIndex); }, [book, chapterIndex]);
 
-  // Upload a new EPUB — store raw bytes, NOT parsed HTML
+  useEffect(() => {
+    if (!IS_CONFIGURED) return;
+    setLoading(true); setLoadingMsg('Loading library…');
+    sbGetLibrary()
+      .then(rows => setLibrary(rows))
+      .catch(e => setError('Could not load library: ' + e.message))
+      .finally(() => { setLoading(false); setLoadingMsg(''); });
+  }, []);
+
   const openFile = useCallback(async (file) => {
     if (!file?.name.toLowerCase().endsWith('.epub')) { setError('Please choose a .epub file.'); return; }
     setLoading(true); setError(null); setLoadingMsg('Reading file…');
     try {
       const arrayBuffer = await file.arrayBuffer();
-
-      // Quick parse just for title/author metadata
-      setLoadingMsg('Reading metadata…');
+      setLoadingMsg('Parsing book…');
       const parsed = await parseEpub(arrayBuffer, file.name);
 
-      // Check if book already exists (same title + author)
-      const exists = library.find(b => b.title === parsed.title && b.author === parsed.author);
-      if (exists) {
-        // Just open it
-        setBook({ id: exists.id, ...parsed });
-        setChapterIndex(loadPos(exists.id));
+      // Check if already saved (same title + author)
+      const existing = library.find(b => b.title === parsed.title && b.author === parsed.author);
+      if (existing) {
+        setBook({ ...existing, chapters: parsed.chapters });
+        setChapterIndex(loadPos(existing.id));
         return;
       }
 
-      // Save raw bytes to IndexedDB — much smaller & more reliable than HTML
-      setLoadingMsg('Saving to library…');
-      const id = 'book_' + Date.now();
-      await dbPut({ id, title: parsed.title, author: parsed.author, fileData: arrayBuffer, fileName: file.name });
-
-      setLibrary(lib => [...lib, { id, title: parsed.title, author: parsed.author }]);
-      setBook({ id, ...parsed });
-      setChapterIndex(loadPos(id));
+      setLoadingMsg('Uploading to cloud… (may take a moment)');
+      const { id, file_path } = await sbUploadBook(arrayBuffer, parsed);
+      const newEntry = { id, title: parsed.title, author: parsed.author, file_path };
+      setLibrary(lib => [newEntry, ...lib]);
+      setBook({ ...newEntry, chapters: parsed.chapters });
+      setChapterIndex(0);
     } catch(e) {
-      setError('Could not open book: ' + e.message);
-    } finally {
-      setLoading(false); setLoadingMsg('');
-    }
+      setError(e.message);
+    } finally { setLoading(false); setLoadingMsg(''); }
   }, [library]);
 
-  // Open from library — load raw bytes, parse on the fly
-  const openFromLibrary = useCallback(async (id) => {
-    setLoading(true); setError(null); setLoadingMsg('Opening book…');
+  const openFromLibrary = useCallback(async (entry) => {
+    setLoading(true); setError(null); setLoadingMsg('Downloading book…');
     try {
-      const record = await dbGet(id);
-      if (!record) throw new Error('Book not found. Try re-adding it.');
+      const arrayBuffer = await sbDownloadBook(entry.file_path);
       setLoadingMsg('Parsing chapters…');
-      const parsed = await parseEpub(record.fileData, record.fileName || record.title);
-      setBook({ id, ...parsed });
-      setChapterIndex(loadPos(id));
+      const parsed = await parseEpub(arrayBuffer, entry.title);
+      setBook({ ...entry, chapters: parsed.chapters });
+      setChapterIndex(loadPos(entry.id));
     } catch(e) {
-      setError('Could not open book: ' + e.message);
-    } finally {
-      setLoading(false); setLoadingMsg('');
-    }
+      setError(e.message);
+    } finally { setLoading(false); setLoadingMsg(''); }
   }, []);
 
-  const deleteBook = useCallback(async (id) => {
-    await dbDelete(id);
-    localStorage.removeItem('pos_' + id);
-    setLibrary(lib => lib.filter(b => b.id !== id));
-    setConfirmDelete(null);
+  const deleteBook = useCallback(async (entry) => {
+    try {
+      await sbDeleteBook(entry.id, entry.file_path);
+      localStorage.removeItem('pos_' + entry.id);
+      setLibrary(lib => lib.filter(b => b.id !== entry.id));
+    } catch(e) { setError('Delete failed: ' + e.message); }
+    finally { setConfirmDelete(null); }
   }, []);
 
   const chapter = book?.chapters[chapterIndex];
@@ -293,7 +330,7 @@ function App() {
     progFill:   { height:'100%', background:t.accent, width:progress+'%', transition:'width .4s ease' },
     content:    { flex:1, overflowY:'auto', WebkitOverflowScrolling:'touch', padding:'28px 20px 90px', maxWidth:680, width:'100%', margin:'0 auto', fontSize:fs, lineHeight:1.85, color:t.text },
     bottomBar:  { position:'fixed', bottom:0, left:0, right:0, display:'flex', alignItems:'center', gap:8, padding:'10px 16px', paddingBottom:'max(10px, env(safe-area-inset-bottom))', background:t.surface, borderTop:`1px solid ${t.border}`, zIndex:100 },
-    navBtn:     (off) => ({ background:off?'transparent':t.accent, color:off?t.accent:'#fff', border:`1px solid ${t.accent}`, borderRadius:20, padding:'7px 18px', fontSize:13, fontWeight:600, cursor:off?'default':'pointer', opacity:off?.35:1, fontFamily:'inherit', transition:'opacity .2s', whiteSpace:'nowrap' }),
+    navBtn:     (off) => ({ background:off?'transparent':t.accent, color:off?t.accent:'#fff', border:`1px solid ${t.accent}`, borderRadius:20, padding:'7px 18px', fontSize:13, fontWeight:600, cursor:off?'default':'pointer', opacity:off?.35:1, fontFamily:'inherit', whiteSpace:'nowrap' }),
     chLabel:    { flex:1, fontSize:11, color:t.accent, textAlign:'center', opacity:.75, overflow:'hidden', textOverflow:'ellipsis', whiteSpace:'nowrap' },
     overlay:    { position:'fixed', inset:0, background:'rgba(0,0,0,.45)', zIndex:190, opacity:showSidebar?1:0, pointerEvents:showSidebar?'auto':'none', transition:'opacity .25s' },
     drawer:     { position:'fixed', top:0, left:showSidebar?0:-290, width:270, height:'100%', background:t.surface, borderRight:`1px solid ${t.border}`, zIndex:200, transition:'left .28s ease', display:'flex', flexDirection:'column', overflowY:'auto', WebkitOverflowScrolling:'touch' },
@@ -304,9 +341,9 @@ function App() {
     thCircle:   (n) => ({ width:30, height:30, borderRadius:'50%', border:theme===n?`2.5px solid ${t.accent}`:`2px solid ${t.border}`, background:THEMES[n].bg, cursor:'pointer' }),
     libWrap:    { flex:1, display:'flex', flexDirection:'column', padding:'20px 16px 100px' },
     libHeader:  { display:'flex', alignItems:'center', justifyContent:'space-between', marginBottom:20 },
-    libTitle:   { fontSize:22, fontWeight:700, letterSpacing:'-.01em' },
+    libTitle:   { fontSize:22, fontWeight:700 },
     addBtn:     { display:'flex', alignItems:'center', justifyContent:'center', gap:8, background:t.accent, color:'#fff', border:'none', borderRadius:16, padding:'13px 20px', fontSize:14, fontWeight:600, cursor:'pointer', fontFamily:'inherit', marginBottom:16, width:'100%' },
-    bookCard:   { display:'flex', alignItems:'center', gap:12, background:t.card, borderRadius:14, padding:'14px 16px', marginBottom:10, cursor:'pointer', position:'relative' },
+    bookCard:   { display:'flex', alignItems:'center', gap:12, background:t.card, borderRadius:14, padding:'14px 16px', marginBottom:10, cursor:'pointer' },
     bookSpine:  { width:40, height:54, borderRadius:6, background:t.accent, flexShrink:0, display:'flex', alignItems:'center', justifyContent:'center', fontSize:20 },
     bookInfo:   { flex:1, overflow:'hidden' },
     bookTitle:  { fontSize:14, fontWeight:600, overflow:'hidden', textOverflow:'ellipsis', whiteSpace:'nowrap', marginBottom:2 },
@@ -323,128 +360,133 @@ function App() {
   };
 
   return (
-    <div style={S.app}
-      onDrop={e => { e.preventDefault(); if (!book) openFile(e.dataTransfer.files[0]); }}
-      onDragOver={e => e.preventDefault()}>
+    <div style={S.app} onDrop={e=>{e.preventDefault();if(!book&&IS_CONFIGURED)openFile(e.dataTransfer.files[0]);}} onDragOver={e=>e.preventDefault()}>
 
+      {/* Top bar — reading mode */}
       {book && (
         <div style={S.bar}>
           <button style={S.iBtn} onClick={() => setShowSidebar(true)}>☰</button>
-          <div style={{ flex:1, textAlign:'center', fontSize:13, fontWeight:600, overflow:'hidden', textOverflow:'ellipsis', whiteSpace:'nowrap' }}>{book.title}</div>
-          <button style={S.iBtn} onClick={() => setShowSettings(s => !s)}>⚙</button>
+          <div style={{flex:1,textAlign:'center',fontSize:13,fontWeight:600,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}>{book.title}</div>
+          <button style={S.iBtn} onClick={() => setShowSettings(s=>!s)}>⚙</button>
         </div>
       )}
+      {book && <div style={S.prog}><div style={S.progFill}/></div>}
 
-      {book && <div style={S.prog}><div style={S.progFill} /></div>}
-
+      {/* Settings */}
       {showSettings && book && (
         <div style={S.settBox}>
           <div style={S.setLabel}>Font Size</div>
-          <div style={{ display:'flex', gap:8, alignItems:'center', marginBottom:14 }}>
-            <button style={{ ...S.iBtn, border:`1px solid ${t.border}`, borderRadius:8, padding:'3px 10px', fontSize:14 }} onClick={() => setFontIdx(f => Math.max(0,f-1))}>A−</button>
-            <span style={{ flex:1, textAlign:'center', fontSize:13 }}>{fs}px</span>
-            <button style={{ ...S.iBtn, border:`1px solid ${t.border}`, borderRadius:8, padding:'3px 10px', fontSize:14 }} onClick={() => setFontIdx(f => Math.min(FONT_SIZES.length-1,f+1))}>A+</button>
+          <div style={{display:'flex',gap:8,alignItems:'center',marginBottom:14}}>
+            <button style={{...S.iBtn,border:`1px solid ${t.border}`,borderRadius:8,padding:'3px 10px',fontSize:14}} onClick={()=>setFontIdx(f=>Math.max(0,f-1))}>A−</button>
+            <span style={{flex:1,textAlign:'center',fontSize:13}}>{fs}px</span>
+            <button style={{...S.iBtn,border:`1px solid ${t.border}`,borderRadius:8,padding:'3px 10px',fontSize:14}} onClick={()=>setFontIdx(f=>Math.min(FONT_SIZES.length-1,f+1))}>A+</button>
           </div>
           <div style={S.setLabel}>Theme</div>
-          <div style={{ display:'flex', gap:10, marginBottom:14 }}>
-            {Object.keys(THEMES).map(n => <button key={n} style={S.thCircle(n)} onClick={() => setTheme(n)} title={n} />)}
+          <div style={{display:'flex',gap:10,marginBottom:14}}>
+            {Object.keys(THEMES).map(n=><button key={n} style={S.thCircle(n)} onClick={()=>setTheme(n)} title={n}/>)}
           </div>
-          <button style={{ ...S.navBtn(false), width:'100%', background:'transparent', color:t.accent, marginTop:4 }}
-            onClick={() => { setBook(null); setShowSettings(false); }}>← Library</button>
+          <button style={{...S.navBtn(false),width:'100%',background:'transparent',color:t.accent,marginTop:4}}
+            onClick={()=>{setBook(null);setShowSettings(false);}}>← Library</button>
         </div>
       )}
 
-      <div style={S.overlay} onClick={() => setShowSidebar(false)} />
+      {/* TOC drawer */}
+      <div style={S.overlay} onClick={()=>setShowSidebar(false)}/>
       <div style={S.drawer}>
         <div style={S.drawerHead}>
-          <button style={{ ...S.iBtn, marginBottom:10, fontSize:13, color:t.text, opacity:.6 }}
-            onClick={() => { setShowSidebar(false); setBook(null); }}>← Library</button>
-          <div style={{ fontWeight:700, fontSize:14, marginBottom:3 }}>{book?.title}</div>
-          <div style={{ fontSize:12, opacity:.55 }}>{book?.author}</div>
+          <button style={{...S.iBtn,marginBottom:10,fontSize:13,color:t.text,opacity:.6}}
+            onClick={()=>{setShowSidebar(false);setBook(null);}}>← Library</button>
+          <div style={{fontWeight:700,fontSize:14,marginBottom:3}}>{book?.title}</div>
+          <div style={{fontSize:12,opacity:.55}}>{book?.author}</div>
         </div>
-        {book?.chapters.map((ch,i) => (
+        {book?.chapters.map((ch,i)=>(
           <div key={ch.id} style={S.tocRow(i===chapterIndex)}
-            onClick={() => { setChapterIndex(i); setShowSidebar(false); }}>
+            onClick={()=>{setChapterIndex(i);setShowSidebar(false);}}>
             {ch.label}
           </div>
         ))}
       </div>
 
+      {/* Delete modal */}
       {confirmDelete && (
         <div style={S.modal}>
           <div style={S.modalBox}>
             <div style={S.modalTitle}>Remove book?</div>
-            <div style={S.modalText}>This will delete the book from your library. You can always add it again.</div>
+            <div style={S.modalText}>This deletes it from your cloud library. You can always re-upload it.</div>
             <div style={S.modalBtns}>
-              <button style={S.cancelBtn} onClick={() => setConfirmDelete(null)}>Cancel</button>
-              <button style={S.confirmBtn} onClick={() => deleteBook(confirmDelete)}>Remove</button>
+              <button style={S.cancelBtn} onClick={()=>setConfirmDelete(null)}>Cancel</button>
+              <button style={S.confirmBtn} onClick={()=>deleteBook(confirmDelete)}>Remove</button>
             </div>
           </div>
         </div>
       )}
 
+      {/* Reading view */}
       {book ? (
         <>
           <div ref={contentRef} className="chapter-content" style={S.content}
-            dangerouslySetInnerHTML={{ __html: sanitizeHtml(chapter?.html || '') }} />
+            dangerouslySetInnerHTML={{__html:sanitizeHtml(chapter?.html||'')}}/>
           <div style={S.bottomBar}>
             <button style={S.navBtn(chapterIndex===0)} disabled={chapterIndex===0}
-              onClick={() => setChapterIndex(i => Math.max(0,i-1))}>← Prev</button>
+              onClick={()=>setChapterIndex(i=>Math.max(0,i-1))}>← Prev</button>
             <div style={S.chLabel}>{chapter?.label}</div>
             <button style={S.navBtn(chapterIndex===book.chapters.length-1)} disabled={chapterIndex===book.chapters.length-1}
-              onClick={() => setChapterIndex(i => Math.min(book.chapters.length-1,i+1))}>Next →</button>
+              onClick={()=>setChapterIndex(i=>Math.min(book.chapters.length-1,i+1))}>Next →</button>
           </div>
         </>
+      ) : !IS_CONFIGURED ? (
+        <SetupScreen t={t}/>
       ) : (
+        /* Library view */
         <div style={S.libWrap}>
           <div style={S.libHeader}>
             <div>
               <div style={S.libTitle}>📚 EPUB Reader</div>
-              <div style={{ fontSize:12, opacity:.4, marginTop:2 }}>{library.length} {library.length===1?'book':'books'} saved</div>
+              <div style={{fontSize:12,opacity:.4,marginTop:2}}>{library.length} {library.length===1?'book':'books'}</div>
             </div>
-            <div style={{ display:'flex', gap:8 }}>
-              {Object.keys(THEMES).map(n => <button key={n} style={S.thCircle(n)} onClick={() => setTheme(n)} title={n} />)}
+            <div style={{display:'flex',gap:8}}>
+              {Object.keys(THEMES).map(n=><button key={n} style={S.thCircle(n)} onClick={()=>setTheme(n)} title={n}/>)}
             </div>
           </div>
 
-          <button style={S.addBtn} onClick={() => fileRef.current?.click()}>
-            <span style={{ fontSize:18 }}>+</span> Add EPUB Book
+          <button style={S.addBtn} onClick={()=>fileRef.current?.click()}>
+            <span style={{fontSize:18}}>+</span> Add EPUB Book
           </button>
-          <input ref={fileRef} type="file" accept=".epub" style={{ display:'none' }}
-            onChange={e => { openFile(e.target.files[0]); e.target.value=''; }} />
+          <input ref={fileRef} type="file" accept=".epub" style={{display:'none'}}
+            onChange={e=>{openFile(e.target.files[0]);e.target.value='';}}/>
 
           {loading && (
-            <div style={{ textAlign:'center', padding:24, color:t.accent, fontSize:14 }}>
-              {loadingMsg || 'Loading…'}
+            <div style={{textAlign:'center',padding:24,color:t.accent,fontSize:14}}>
+              {loadingMsg||'Loading…'}
             </div>
           )}
           {error && (
-            <div style={{ background:'#fdecea', border:'1px solid #f5c6cb', borderRadius:12, padding:'12px 16px', marginBottom:12, color:'#a93226', fontSize:13 }}>
+            <div style={{background:'#fdecea',border:'1px solid #f5c6cb',borderRadius:12,padding:'12px 16px',marginBottom:12,color:'#a93226',fontSize:13}}>
               {error}
             </div>
           )}
 
-          {!loading && library.length === 0 && !error && (
+          {!loading && library.length===0 && !error && (
             <div style={S.emptyState}>
-              <div style={{ fontSize:56 }}>📖</div>
-              <div style={{ fontSize:16, fontWeight:600 }}>No books yet</div>
-              <div style={{ fontSize:13 }}>Tap "Add EPUB Book" to get started</div>
+              <div style={{fontSize:56}}>📖</div>
+              <div style={{fontSize:16,fontWeight:600}}>No books yet</div>
+              <div style={{fontSize:13}}>Tap "Add EPUB Book" to get started</div>
             </div>
           )}
 
-          {library.map(b => (
+          {library.map(b=>(
             <div key={b.id} className="book-card" style={S.bookCard}>
-              <div style={S.bookSpine} onClick={() => openFromLibrary(b.id)}>📖</div>
-              <div style={S.bookInfo} onClick={() => openFromLibrary(b.id)}>
+              <div style={S.bookSpine} onClick={()=>openFromLibrary(b)}>📖</div>
+              <div style={S.bookInfo} onClick={()=>openFromLibrary(b)}>
                 <div style={S.bookTitle}>{b.title}</div>
                 <div style={S.bookAuthor}>{b.author}</div>
               </div>
-              <button style={S.delBtn} onClick={() => setConfirmDelete(b.id)}>🗑</button>
+              <button style={S.delBtn} onClick={()=>setConfirmDelete(b)}>🗑</button>
             </div>
           ))}
 
-          <div style={{ fontSize:11, opacity:.28, textAlign:'center', marginTop:20 }}>
-            Books stored on your device · Works offline
+          <div style={{fontSize:11,opacity:.28,textAlign:'center',marginTop:20}}>
+            Books stored in the cloud · Available on any device
           </div>
         </div>
       )}
@@ -452,13 +494,13 @@ function App() {
   );
 }
 
-ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+ReactDOM.createRoot(document.getElementById('root')).render(<App/>);
 </script>
 
 <script>
   if ('serviceWorker' in navigator) {
     window.addEventListener('load', () => {
-      navigator.serviceWorker.register('./sw.js').catch(() => {});
+      navigator.serviceWorker.register('./sw.js').catch(()=>{});
     });
   }
 </script>
