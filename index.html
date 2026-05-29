@@ -5,44 +5,25 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
   <meta name="apple-mobile-web-app-capable" content="yes" />
   <meta name="apple-mobile-web-app-status-bar-style" content="default" />
-  <meta name="apple-mobile-web-app-title" content="Folio" />
+  <meta name="apple-mobile-web-app-title" content="EPUB Reader" />
   <meta name="theme-color" content="#8B5E3C" />
-  <title>Folio – EPUB Reader</title>
+  <title>EPUB Reader</title>
   <link rel="manifest" href="manifest.json" />
-  <!-- Apple touch icon fallback (inline SVG as data URI) -->
   <link rel="apple-touch-icon" href="icon-192.png" />
-
   <style>
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
-    html, body, #root {
-      height: 100%;
-      height: -webkit-fill-available;
-      overscroll-behavior: none;
-    }
+    html, body, #root { height: 100%; height: -webkit-fill-available; overscroll-behavior: none; }
     body { -webkit-text-size-adjust: 100%; }
-    /* Chapter content styles */
-    .chapter-content h1, .chapter-content h2, .chapter-content h3 {
-      margin: 1.4em 0 0.6em;
-      line-height: 1.3;
-    }
-    .chapter-content p { margin: 0 0 1em; }
-    .chapter-content img { max-width: 100%; height: auto; display: block; margin: 1em auto; border-radius: 4px; }
-    /* Hard reset — overrides any inline styles left in EPUB markup */
     .chapter-content * { text-decoration: none !important; }
     .chapter-content a { color: inherit; text-decoration: underline !important; opacity: 0.7; }
-    .chapter-content span, .chapter-content div, .chapter-content p,
-    .chapter-content h1, .chapter-content h2, .chapter-content h3,
-    .chapter-content h4, .chapter-content h5, .chapter-content h6 {
-      text-decoration: none !important;
-    }
-    .chapter-content blockquote {
-      border-left: 3px solid currentColor;
-      margin: 1em 0;
-      padding-left: 1em;
-      opacity: 0.75;
-    }
-    .chapter-content table { width: 100%; border-collapse: collapse; margin: 1em 0; font-size: 0.9em; }
-    .chapter-content td, .chapter-content th { border: 1px solid rgba(0,0,0,0.15); padding: 6px 10px; }
+    .chapter-content h1,.chapter-content h2,.chapter-content h3 { margin: 1.4em 0 0.6em; line-height: 1.3; }
+    .chapter-content h4,.chapter-content h5,.chapter-content h6 { margin: 1em 0 0.4em; line-height: 1.3; }
+    .chapter-content p { margin: 0 0 1em; }
+    .chapter-content img { max-width:100%; height:auto; display:block; margin:1em auto; border-radius:4px; }
+    .chapter-content blockquote { border-left:3px solid currentColor; margin:1em 0; padding-left:1em; opacity:.75; }
+    .chapter-content table { width:100%; border-collapse:collapse; margin:1em 0; font-size:.9em; }
+    .chapter-content td,.chapter-content th { border:1px solid rgba(0,0,0,.15); padding:6px 10px; }
+    .book-card:active { opacity: 0.7; }
   </style>
 </head>
 <body>
@@ -58,202 +39,279 @@ const { useState, useEffect, useRef, useCallback } = React;
 
 const FONT_SIZES = [14, 16, 18, 20, 24];
 const THEMES = {
-  light: { bg: '#FAF7F2', text: '#2C2416', surface: '#F0EBE1', accent: '#8B5E3C', border: '#DDD5C8' },
-  sepia: { bg: '#F4ECD8', text: '#3B2F1E', surface: '#EAE0CA', accent: '#7A5C38', border: '#D4C4A8' },
-  dark:  { bg: '#1A1814', text: '#E8E0D0', surface: '#252219', accent: '#C4956A', border: '#3A362E' },
+  light: { bg:'#FAF7F2', text:'#2C2416', surface:'#F0EBE1', accent:'#8B5E3C', border:'#DDD5C8', card:'#EDE7DA' },
+  sepia: { bg:'#F4ECD8', text:'#3B2F1E', surface:'#EAE0CA', accent:'#7A5C38', border:'#D4C4A8', card:'#E4D8C0' },
+  dark:  { bg:'#1A1814', text:'#E8E0D0', surface:'#252219', accent:'#C4956A', border:'#3A362E', card:'#2E2A24' },
 };
 
-// ── EPUB parsing helpers ────────────────────────────────────────────────────
+// ── IndexedDB ────────────────────────────────────────────────────────────────
+const DB_NAME = 'folio_db', DB_VER = 1, STORE = 'books';
 
-function qsAll(doc, localName) {
-  const direct = doc.querySelectorAll(localName);
-  if (direct.length > 0) return Array.from(direct);
-  return Array.from(doc.getElementsByTagNameNS('*', localName));
+function openDB() {
+  return new Promise((res, rej) => {
+    const req = indexedDB.open(DB_NAME, DB_VER);
+    req.onupgradeneeded = e => e.target.result.createObjectStore(STORE, { keyPath: 'id' });
+    req.onsuccess = e => res(e.target.result);
+    req.onerror   = e => rej(e.target.error);
+  });
 }
-function qs(doc, localName) { return qsAll(doc, localName)[0] || null; }
+async function dbGetAll() {
+  const db = await openDB();
+  return new Promise((res, rej) => {
+    const req = db.transaction(STORE,'readonly').objectStore(STORE).getAll();
+    req.onsuccess = e => res(e.target.result);
+    req.onerror   = e => rej(e.target.error);
+  });
+}
+async function dbPut(record) {
+  const db = await openDB();
+  return new Promise((res, rej) => {
+    const req = db.transaction(STORE,'readwrite').objectStore(STORE).put(record);
+    req.onsuccess = e => res(e.target.result);
+    req.onerror   = e => rej(e.target.error);
+  });
+}
+async function dbDelete(id) {
+  const db = await openDB();
+  return new Promise((res, rej) => {
+    const req = db.transaction(STORE,'readwrite').objectStore(STORE).delete(id);
+    req.onsuccess = e => res(e.target.result);
+    req.onerror   = e => rej(e.target.error);
+  });
+}
 
+// ── EPUB parsing ──────────────────────────────────────────────────────────────
+function qsAll(doc, name) {
+  const d = doc.querySelectorAll(name);
+  return d.length ? Array.from(d) : Array.from(doc.getElementsByTagNameNS('*', name));
+}
+function qs(doc, name) { return qsAll(doc, name)[0] || null; }
 function getDcText(doc, name) {
-  const selectors = [`dc\\:${name}`, name, `metadata ${name}`];
-  for (const sel of selectors) {
-    try { const el = doc.querySelector(sel); if (el?.textContent) return el.textContent.trim(); } catch (_) {}
+  for (const sel of [`dc\\:${name}`, name, `metadata ${name}`]) {
+    try { const el = doc.querySelector(sel); if (el?.textContent) return el.textContent.trim(); } catch(_) {}
   }
   const els = doc.getElementsByTagNameNS('http://purl.org/dc/elements/1.1/', name);
-  return els.length > 0 ? els[0].textContent.trim() : null;
+  return els[0]?.textContent.trim() || null;
 }
 
-async function parseEpub(file) {
-  const arrayBuffer = await file.arrayBuffer();
-  const zip = new JSZip();
+async function parseEpub(arrayBuffer, fileName) {
+  const zip  = new JSZip();
   const epub = await zip.loadAsync(arrayBuffer);
+  const parser = new DOMParser();
 
   const containerXml = await epub.file('META-INF/container.xml')?.async('text');
   if (!containerXml) throw new Error('Invalid EPUB: no container.xml');
-
-  const parser = new DOMParser();
-  const opfPath = qs(parser.parseFromString(containerXml, 'application/xml'), 'rootfile')?.getAttribute('full-path');
+  const opfPath = qs(parser.parseFromString(containerXml,'application/xml'),'rootfile')?.getAttribute('full-path');
   if (!opfPath) throw new Error('Invalid EPUB: no OPF path');
 
   const opfText = await epub.file(opfPath)?.async('text');
   if (!opfText) throw new Error('Invalid EPUB: no OPF file');
-
-  const opfDoc = parser.parseFromString(opfText, 'application/xml');
-  const opfDir = opfPath.includes('/') ? opfPath.substring(0, opfPath.lastIndexOf('/') + 1) : '';
+  const opfDoc = parser.parseFromString(opfText,'application/xml');
+  const opfDir = opfPath.includes('/') ? opfPath.substring(0, opfPath.lastIndexOf('/')+1) : '';
 
   const manifest = {};
-  qsAll(opfDoc, 'item').forEach(item => {
-    manifest[item.getAttribute('id')] = { href: item.getAttribute('href'), mediaType: item.getAttribute('media-type') };
+  qsAll(opfDoc,'item').forEach(el => {
+    manifest[el.getAttribute('id')] = { href: el.getAttribute('href'), mediaType: el.getAttribute('media-type') };
   });
 
-  const spineEl = qs(opfDoc, 'spine');
+  const spineEl = qs(opfDoc,'spine');
   const spineItems = [];
-  qsAll(opfDoc, 'itemref').forEach(ref => {
+  qsAll(opfDoc,'itemref').forEach(ref => {
     const id = ref.getAttribute('idref');
     if (manifest[id]) spineItems.push({ id, ...manifest[id] });
   });
 
-  // NCX TOC
   let toc = [];
   const ncxEntry = (spineEl?.getAttribute('toc') && manifest[spineEl.getAttribute('toc')]) ||
     Object.values(manifest).find(m => m.mediaType === 'application/x-dtbncx+xml');
   if (ncxEntry) {
     const ncxFile = epub.file(opfDir + ncxEntry.href);
     if (ncxFile) {
-      const ncxDoc = parser.parseFromString(await ncxFile.async('text'), 'application/xml');
-      Array.from(ncxDoc.getElementsByTagNameNS('*', 'navPoint')).forEach(np => {
-        const label = np.getElementsByTagNameNS('*', 'text')[0]?.textContent?.trim() || 'Chapter';
-        const src = np.getElementsByTagNameNS('*', 'content')[0]?.getAttribute('src') || '';
-        toc.push({ label, href: src.includes('#') ? src.split('#')[0] : src });
+      const ncxDoc = parser.parseFromString(await ncxFile.async('text'),'application/xml');
+      Array.from(ncxDoc.getElementsByTagNameNS('*','navPoint')).forEach(np => {
+        const label = np.getElementsByTagNameNS('*','text')[0]?.textContent?.trim() || 'Chapter';
+        const src   = np.getElementsByTagNameNS('*','content')[0]?.getAttribute('src') || '';
+        toc.push({ label, href: src.split('#')[0] });
       });
     }
   }
 
-  const title  = getDcText(opfDoc, 'title')   || file.name.replace(/\.epub$/i, '');
-  const author = getDcText(opfDoc, 'creator') || 'Unknown Author';
+  const title  = getDcText(opfDoc,'title')   || fileName.replace(/\.epub$/i,'');
+  const author = getDcText(opfDoc,'creator') || 'Unknown Author';
 
   const chapters = [];
   for (let i = 0; i < spineItems.length; i++) {
     const item = spineItems[i];
-    const chapterFile = epub.file(opfDir + item.href);
-    if (!chapterFile) continue;
-    const html = await chapterFile.async('text');
-    const hrefBase = item.href.split('#')[0];
-    const tocEntry = toc.find(t => t.href.split('#')[0] === hrefBase);
-    chapters.push({ id: item.id, href: item.href, label: tocEntry?.label || `Section ${i + 1}`, html });
+    const f = epub.file(opfDir + item.href);
+    if (!f) continue;
+    const html = await f.async('text');
+    const tocEntry = toc.find(t => t.href.split('#')[0] === item.href.split('#')[0]);
+    chapters.push({ id: item.id, href: item.href, label: tocEntry?.label || `Section ${i+1}`, html });
   }
-
-  if (chapters.length === 0) throw new Error('No readable chapters found.');
+  if (!chapters.length) throw new Error('No readable chapters found.');
   return { title, author, chapters };
 }
 
 function sanitizeHtml(html) {
-  const doc = new DOMParser().parseFromString(html, 'text/html');
-  doc.querySelectorAll('script, style, link').forEach(el => el.remove());
-  // Strip inline styles that carry EPUB formatting (underlines, fonts, colours)
-  // but preserve structural attributes like colspan, src, alt
+  const doc = new DOMParser().parseFromString(html,'text/html');
+  doc.querySelectorAll('script,style,link').forEach(el => el.remove());
   doc.querySelectorAll('[style]').forEach(el => el.removeAttribute('style'));
   return doc.body?.innerHTML || '';
 }
 
-// ── Persist reading position in localStorage ────────────────────────────────
-function savePosition(title, index) {
-  try { localStorage.setItem('folio_pos_' + btoa(title).slice(0,20), index); } catch(_) {}
+function savePos(title, idx) {
+  try { localStorage.setItem('fp_'+btoa(encodeURIComponent(title)).slice(0,24), idx); } catch(_) {}
 }
-function loadPosition(title) {
-  try { return parseInt(localStorage.getItem('folio_pos_' + btoa(title).slice(0,20))) || 0; } catch(_) { return 0; }
+function loadPos(title) {
+  try { return parseInt(localStorage.getItem('fp_'+btoa(encodeURIComponent(title)).slice(0,24))) || 0; } catch(_) { return 0; }
 }
 
-// ── App ──────────────────────────────────────────────────────────────────────
+// ── App ───────────────────────────────────────────────────────────────────────
 function App() {
-  const [book, setBook]               = useState(null);
+  const [library, setLibrary]           = useState([]);   // [{id,title,author}]
+  const [book, setBook]                 = useState(null); // full parsed book in memory
   const [chapterIndex, setChapterIndex] = useState(0);
-  const [fontIdx, setFontIdx]         = useState(1);
-  const [theme, setTheme]             = useState(() => localStorage.getItem('folio_theme') || 'light');
-  const [showSidebar, setShowSidebar] = useState(false);
+  const [fontIdx, setFontIdx]           = useState(1);
+  const [theme, setTheme]               = useState(() => localStorage.getItem('folio_theme') || 'light');
+  const [showSidebar, setShowSidebar]   = useState(false);
   const [showSettings, setShowSettings] = useState(false);
-  const [loading, setLoading]         = useState(false);
-  const [error, setError]             = useState(null);
+  const [loading, setLoading]           = useState(false);
+  const [loadingMsg, setLoadingMsg]     = useState('');
+  const [error, setError]               = useState(null);
+  const [confirmDelete, setConfirmDelete] = useState(null);
   const contentRef = useRef(null);
   const fileRef    = useRef(null);
 
   const t  = THEMES[theme];
   const fs = FONT_SIZES[fontIdx];
-  const progress = book ? Math.round(((chapterIndex + 1) / book.chapters.length) * 100) : 0;
+  const progress = book ? Math.round(((chapterIndex+1)/book.chapters.length)*100) : 0;
 
-  // Persist theme
+  // Load library index on mount
+  useEffect(() => {
+    dbGetAll().then(rows => {
+      setLibrary(rows.map(r => ({ id: r.id, title: r.title, author: r.author })));
+    }).catch(() => {});
+  }, []);
+
   useEffect(() => { localStorage.setItem('folio_theme', theme); }, [theme]);
+  useEffect(() => { contentRef.current?.scrollTo(0,0); }, [chapterIndex]);
+  useEffect(() => { if (book) savePos(book.title, chapterIndex); }, [book, chapterIndex]);
 
-  // Scroll to top on chapter change
-  useEffect(() => { contentRef.current?.scrollTo(0, 0); }, [chapterIndex]);
-
-  // Save reading position
-  useEffect(() => { if (book) savePosition(book.title, chapterIndex); }, [book, chapterIndex]);
-
+  // Add a new book from file picker
   const openFile = useCallback(async (file) => {
     if (!file?.name.toLowerCase().endsWith('.epub')) { setError('Please choose a .epub file.'); return; }
     setLoading(true); setError(null);
+    setLoadingMsg('Reading file…');
     try {
-      const parsed = await parseEpub(file);
-      const savedPos = loadPosition(parsed.title);
-      setBook(parsed);
-      setChapterIndex(savedPos);
+      const arrayBuffer = await file.arrayBuffer();
+      setLoadingMsg('Parsing chapters…');
+      const parsed = await parseEpub(arrayBuffer, file.name);
+      const id = 'book_' + Date.now();
+      setLoadingMsg('Saving to library…');
+      await dbPut({ id, title: parsed.title, author: parsed.author, chapters: parsed.chapters });
+      setLibrary(lib => [...lib, { id, title: parsed.title, author: parsed.author }]);
+      // Open it immediately
+      setBook({ id, ...parsed });
+      setChapterIndex(loadPos(parsed.title));
     } catch(e) { setError('Could not open book: ' + e.message); }
-    finally { setLoading(false); }
+    finally { setLoading(false); setLoadingMsg(''); }
+  }, []);
+
+  // Open an existing book from IndexedDB
+  const openFromLibrary = useCallback(async (id) => {
+    setLoading(true); setError(null); setLoadingMsg('Opening…');
+    try {
+      const db = await openDB();
+      const record = await new Promise((res, rej) => {
+        const req = db.transaction(STORE,'readonly').objectStore(STORE).get(id);
+        req.onsuccess = e => res(e.target.result);
+        req.onerror   = e => rej(e.target.error);
+      });
+      if (!record) throw new Error('Book not found in storage.');
+      setBook(record);
+      setChapterIndex(loadPos(record.title));
+    } catch(e) { setError('Could not open book: ' + e.message); }
+    finally { setLoading(false); setLoadingMsg(''); }
+  }, []);
+
+  const deleteBook = useCallback(async (id) => {
+    await dbDelete(id);
+    setLibrary(lib => lib.filter(b => b.id !== id));
+    setConfirmDelete(null);
   }, []);
 
   const chapter = book?.chapters[chapterIndex];
 
-  // ── styles (inline, theme-reactive) ───────────────────────────────────────
+  // ── Styles ────────────────────────────────────────────────────────────────
   const S = {
-    app: { fontFamily: "Georgia, 'Times New Roman', serif", minHeight: '100dvh', background: t.bg, color: t.text, display: 'flex', flexDirection: 'column', transition: 'background .3s,color .3s' },
-    bar: { display: 'flex', alignItems: 'center', gap: 8, padding: '10px 14px', background: t.surface, borderBottom: `1px solid ${t.border}`, position: 'sticky', top: 0, zIndex: 100 },
-    iBtn: { background: 'none', border: 'none', cursor: 'pointer', color: t.accent, padding: 6, borderRadius: 8, fontSize: 22, lineHeight: 1, display:'flex', alignItems:'center', justifyContent:'center', minWidth: 36, minHeight: 36 },
-    prog: { height: 3, background: t.border },
-    progFill: { height: '100%', background: t.accent, width: progress + '%', transition: 'width .4s ease' },
-    content: { flex: 1, overflowY: 'auto', WebkitOverflowScrolling: 'touch', padding: '28px 20px 90px', maxWidth: 680, width: '100%', margin: '0 auto', fontSize: fs, lineHeight: 1.85, color: t.text },
-    bottomBar: { position: 'fixed', bottom: 0, left: 0, right: 0, display: 'flex', alignItems: 'center', gap: 8, padding: '10px 16px', paddingBottom: 'max(10px, env(safe-area-inset-bottom))', background: t.surface, borderTop: `1px solid ${t.border}`, zIndex: 100 },
-    navBtn: (off) => ({ background: off ? 'transparent' : t.accent, color: off ? t.accent : '#fff', border: `1px solid ${t.accent}`, borderRadius: 20, padding: '7px 18px', fontSize: 13, fontWeight: 600, cursor: off ? 'default' : 'pointer', opacity: off ? 0.35 : 1, fontFamily: 'inherit', transition: 'opacity .2s', whiteSpace: 'nowrap' }),
-    chLabel: { flex: 1, fontSize: 11, color: t.accent, textAlign: 'center', opacity: .75, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' },
-    overlay: { position: 'fixed', inset: 0, background: 'rgba(0,0,0,.45)', zIndex: 190, opacity: showSidebar ? 1 : 0, pointerEvents: showSidebar ? 'auto' : 'none', transition: 'opacity .25s' },
-    drawer: { position: 'fixed', top: 0, left: showSidebar ? 0 : -290, width: 270, height: '100%', background: t.surface, borderRight: `1px solid ${t.border}`, zIndex: 200, transition: 'left .28s ease', display: 'flex', flexDirection: 'column', overflowY: 'auto', WebkitOverflowScrolling: 'touch' },
-    drawerHead: { padding: '20px 16px 12px', borderBottom: `1px solid ${t.border}`, flexShrink: 0 },
-    tocRow: (a) => ({ padding: '11px 16px', cursor: 'pointer', fontSize: 13, borderLeft: a ? `3px solid ${t.accent}` : '3px solid transparent', background: a ? t.bg : 'transparent', color: a ? t.accent : t.text, fontWeight: a ? 600 : 400 }),
-    settBox: { position: 'fixed', top: 54, right: 10, background: t.surface, border: `1px solid ${t.border}`, borderRadius: 16, padding: 16, zIndex: 160, width: 210, boxShadow: '0 8px 32px rgba(0,0,0,.22)' },
-    setLabel: { fontSize: 10, fontWeight: 700, letterSpacing: '.1em', opacity: .45, textTransform: 'uppercase', marginBottom: 8 },
-    thCircle: (n) => ({ width: 30, height: 30, borderRadius: '50%', border: theme===n ? `2.5px solid ${t.accent}` : `2px solid ${t.border}`, background: THEMES[n].bg, cursor: 'pointer' }),
-    dropWrap: { flex: 1, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', padding: 32, gap: 16 },
-    dropBox: { border: `2px dashed ${t.accent}`, borderRadius: 24, padding: '36px 28px', cursor: 'pointer', width: '100%', maxWidth: 340, textAlign: 'center' },
+    app:        { fontFamily:"Georgia,'Times New Roman',serif", minHeight:'100dvh', background:t.bg, color:t.text, display:'flex', flexDirection:'column', transition:'background .3s,color .3s' },
+    bar:        { display:'flex', alignItems:'center', gap:8, padding:'10px 14px', background:t.surface, borderBottom:`1px solid ${t.border}`, position:'sticky', top:0, zIndex:100 },
+    iBtn:       { background:'none', border:'none', cursor:'pointer', color:t.accent, padding:6, borderRadius:8, fontSize:22, lineHeight:1, display:'flex', alignItems:'center', justifyContent:'center', minWidth:36, minHeight:36 },
+    prog:       { height:3, background:t.border },
+    progFill:   { height:'100%', background:t.accent, width:progress+'%', transition:'width .4s ease' },
+    content:    { flex:1, overflowY:'auto', WebkitOverflowScrolling:'touch', padding:'28px 20px 90px', maxWidth:680, width:'100%', margin:'0 auto', fontSize:fs, lineHeight:1.85, color:t.text },
+    bottomBar:  { position:'fixed', bottom:0, left:0, right:0, display:'flex', alignItems:'center', gap:8, padding:'10px 16px', paddingBottom:'max(10px, env(safe-area-inset-bottom))', background:t.surface, borderTop:`1px solid ${t.border}`, zIndex:100 },
+    navBtn:     (off) => ({ background:off?'transparent':t.accent, color:off?t.accent:'#fff', border:`1px solid ${t.accent}`, borderRadius:20, padding:'7px 18px', fontSize:13, fontWeight:600, cursor:off?'default':'pointer', opacity:off?.35:1, fontFamily:'inherit', transition:'opacity .2s', whiteSpace:'nowrap' }),
+    chLabel:    { flex:1, fontSize:11, color:t.accent, textAlign:'center', opacity:.75, overflow:'hidden', textOverflow:'ellipsis', whiteSpace:'nowrap' },
+    overlay:    { position:'fixed', inset:0, background:'rgba(0,0,0,.45)', zIndex:190, opacity:showSidebar?1:0, pointerEvents:showSidebar?'auto':'none', transition:'opacity .25s' },
+    drawer:     { position:'fixed', top:0, left:showSidebar?0:-290, width:270, height:'100%', background:t.surface, borderRight:`1px solid ${t.border}`, zIndex:200, transition:'left .28s ease', display:'flex', flexDirection:'column', overflowY:'auto', WebkitOverflowScrolling:'touch' },
+    drawerHead: { padding:'20px 16px 12px', borderBottom:`1px solid ${t.border}`, flexShrink:0 },
+    tocRow:     (a) => ({ padding:'11px 16px', cursor:'pointer', fontSize:13, borderLeft:a?`3px solid ${t.accent}`:'3px solid transparent', background:a?t.bg:'transparent', color:a?t.accent:t.text, fontWeight:a?600:400 }),
+    settBox:    { position:'fixed', top:54, right:10, background:t.surface, border:`1px solid ${t.border}`, borderRadius:16, padding:16, zIndex:160, width:210, boxShadow:'0 8px 32px rgba(0,0,0,.22)' },
+    setLabel:   { fontSize:10, fontWeight:700, letterSpacing:'.1em', opacity:.45, textTransform:'uppercase', marginBottom:8 },
+    thCircle:   (n) => ({ width:30, height:30, borderRadius:'50%', border:theme===n?`2.5px solid ${t.accent}`:`2px solid ${t.border}`, background:THEMES[n].bg, cursor:'pointer' }),
+    libWrap:    { flex:1, display:'flex', flexDirection:'column', padding:'20px 16px 100px' },
+    libHeader:  { display:'flex', alignItems:'center', justifyContent:'space-between', marginBottom:20 },
+    libTitle:   { fontSize:22, fontWeight:700, letterSpacing:'-.01em' },
+    themeRow:   { display:'flex', gap:8 },
+    addBtn:     { display:'flex', alignItems:'center', justifyContent:'center', gap:8, background:t.accent, color:'#fff', border:'none', borderRadius:16, padding:'13px 20px', fontSize:14, fontWeight:600, cursor:'pointer', fontFamily:'inherit', marginBottom:16, width:'100%' },
+    bookCard:   { display:'flex', alignItems:'center', gap:12, background:t.card, borderRadius:14, padding:'14px 16px', marginBottom:10, cursor:'pointer', position:'relative' },
+    bookSpine:  { width:40, height:54, borderRadius:6, background:t.accent, flexShrink:0, display:'flex', alignItems:'center', justifyContent:'center', fontSize:20 },
+    bookInfo:   { flex:1, overflow:'hidden' },
+    bookTitle:  { fontSize:14, fontWeight:600, overflow:'hidden', textOverflow:'ellipsis', whiteSpace:'nowrap', marginBottom:2 },
+    bookAuthor: { fontSize:12, opacity:.55, overflow:'hidden', textOverflow:'ellipsis', whiteSpace:'nowrap' },
+    delBtn:     { background:'none', border:'none', cursor:'pointer', color:'#c0392b', fontSize:20, padding:'4px 6px', borderRadius:8, flexShrink:0 },
+    emptyState: { flex:1, display:'flex', flexDirection:'column', alignItems:'center', justifyContent:'center', gap:12, opacity:.4, textAlign:'center', padding:40 },
+    modal:      { position:'fixed', inset:0, background:'rgba(0,0,0,.55)', zIndex:300, display:'flex', alignItems:'center', justifyContent:'center', padding:24 },
+    modalBox:   { background:t.surface, borderRadius:20, padding:24, width:'100%', maxWidth:320 },
+    modalTitle: { fontSize:16, fontWeight:700, marginBottom:8 },
+    modalText:  { fontSize:14, opacity:.65, marginBottom:20, lineHeight:1.5 },
+    modalBtns:  { display:'flex', gap:10 },
+    cancelBtn:  { flex:1, background:'transparent', border:`1px solid ${t.border}`, borderRadius:12, padding:'10px', fontSize:13, fontWeight:600, cursor:'pointer', fontFamily:'inherit', color:t.text },
+    confirmBtn: { flex:1, background:'#c0392b', border:'none', borderRadius:12, padding:'10px', fontSize:13, fontWeight:600, cursor:'pointer', fontFamily:'inherit', color:'#fff' },
   };
 
   return (
-    <div style={S.app} onDrop={e => { e.preventDefault(); openFile(e.dataTransfer.files[0]); }} onDragOver={e => e.preventDefault()}>
+    <div style={S.app}
+      onDrop={e => { e.preventDefault(); if (!book) openFile(e.dataTransfer.files[0]); }}
+      onDragOver={e => e.preventDefault()}>
 
-      {/* ── Top bar ── */}
+      {/* ── Top bar (reading mode) ── */}
       {book && (
         <div style={S.bar}>
-          <button style={S.iBtn} onClick={() => setShowSidebar(true)} aria-label="Chapters">☰</button>
-          <div style={{ flex: 1, textAlign: 'center', fontSize: 13, fontWeight: 600, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', letterSpacing: '.02em' }}>{book.title}</div>
-          <button style={S.iBtn} onClick={() => setShowSettings(s => !s)} aria-label="Settings">⚙</button>
+          <button style={S.iBtn} onClick={() => setShowSidebar(true)}>☰</button>
+          <div style={{ flex:1, textAlign:'center', fontSize:13, fontWeight:600, overflow:'hidden', textOverflow:'ellipsis', whiteSpace:'nowrap' }}>{book.title}</div>
+          <button style={S.iBtn} onClick={() => setShowSettings(s => !s)}>⚙</button>
         </div>
       )}
 
-      {/* ── Progress bar ── */}
       {book && <div style={S.prog}><div style={S.progFill} /></div>}
 
       {/* ── Settings panel ── */}
       {showSettings && book && (
         <div style={S.settBox}>
           <div style={S.setLabel}>Font Size</div>
-          <div style={{ display: 'flex', gap: 8, alignItems: 'center', marginBottom: 14 }}>
-            <button style={{ ...S.iBtn, border: `1px solid ${t.border}`, borderRadius: 8, padding: '3px 10px', fontSize: 14 }} onClick={() => setFontIdx(f => Math.max(0, f-1))}>A−</button>
-            <span style={{ flex: 1, textAlign: 'center', fontSize: 13 }}>{fs}px</span>
-            <button style={{ ...S.iBtn, border: `1px solid ${t.border}`, borderRadius: 8, padding: '3px 10px', fontSize: 14 }} onClick={() => setFontIdx(f => Math.min(FONT_SIZES.length-1, f+1))}>A+</button>
+          <div style={{ display:'flex', gap:8, alignItems:'center', marginBottom:14 }}>
+            <button style={{ ...S.iBtn, border:`1px solid ${t.border}`, borderRadius:8, padding:'3px 10px', fontSize:14 }} onClick={() => setFontIdx(f => Math.max(0,f-1))}>A−</button>
+            <span style={{ flex:1, textAlign:'center', fontSize:13 }}>{fs}px</span>
+            <button style={{ ...S.iBtn, border:`1px solid ${t.border}`, borderRadius:8, padding:'3px 10px', fontSize:14 }} onClick={() => setFontIdx(f => Math.min(FONT_SIZES.length-1,f+1))}>A+</button>
           </div>
           <div style={S.setLabel}>Theme</div>
-          <div style={{ display: 'flex', gap: 10, marginBottom: 14 }}>
+          <div style={{ display:'flex', gap:10, marginBottom:14 }}>
             {Object.keys(THEMES).map(n => <button key={n} style={S.thCircle(n)} onClick={() => setTheme(n)} title={n} />)}
           </div>
-          <button style={{ ...S.navBtn(false), width: '100%', background: 'transparent', color: t.accent, marginTop: 4 }}
-            onClick={() => { setBook(null); setShowSettings(false); }}>Open New Book</button>
+          <button style={{ ...S.navBtn(false), width:'100%', background:'transparent', color:t.accent, marginTop:4 }}
+            onClick={() => { setBook(null); setShowSettings(false); }}>← Library</button>
         </div>
       )}
 
@@ -261,42 +319,99 @@ function App() {
       <div style={S.overlay} onClick={() => setShowSidebar(false)} />
       <div style={S.drawer}>
         <div style={S.drawerHead}>
-          <div style={{ fontWeight: 700, fontSize: 14, marginBottom: 3 }}>{book?.title}</div>
-          <div style={{ fontSize: 12, opacity: .55 }}>{book?.author}</div>
+          <button style={{ ...S.iBtn, marginBottom:10, fontSize:14, gap:6, color:t.text, opacity:.6 }}
+            onClick={() => { setShowSidebar(false); setBook(null); }}>← Library</button>
+          <div style={{ fontWeight:700, fontSize:14, marginBottom:3 }}>{book?.title}</div>
+          <div style={{ fontSize:12, opacity:.55 }}>{book?.author}</div>
         </div>
-        {book?.chapters.map((ch, i) => (
-          <div key={ch.id} style={S.tocRow(i === chapterIndex)}
+        {book?.chapters.map((ch,i) => (
+          <div key={ch.id} style={S.tocRow(i===chapterIndex)}
             onClick={() => { setChapterIndex(i); setShowSidebar(false); }}>
             {ch.label}
           </div>
         ))}
       </div>
 
-      {/* ── Main area ── */}
-      {!book ? (
-        <div style={S.dropWrap}>
-          <div style={S.dropBox} onClick={() => fileRef.current?.click()}>
-            <div style={{ fontSize: 52, marginBottom: 12 }}>📖</div>
-            <div style={{ fontSize: 19, fontWeight: 700, marginBottom: 8 }}>Folio</div>
-            <div style={{ fontSize: 14, opacity: .55, lineHeight: 1.5 }}>Tap to open an EPUB, or drop one here</div>
-            {loading && <div style={{ marginTop: 14, color: t.accent, fontSize: 13 }}>Opening book…</div>}
-            {error   && <div style={{ marginTop: 10, color: '#d95555', fontSize: 13 }}>{error}</div>}
+      {/* ── Delete confirm modal ── */}
+      {confirmDelete && (
+        <div style={S.modal}>
+          <div style={S.modalBox}>
+            <div style={S.modalTitle}>Remove book?</div>
+            <div style={S.modalText}>This will delete the book from your library. You can always add it again.</div>
+            <div style={S.modalBtns}>
+              <button style={S.cancelBtn} onClick={() => setConfirmDelete(null)}>Cancel</button>
+              <button style={S.confirmBtn} onClick={() => deleteBook(confirmDelete)}>Remove</button>
+            </div>
           </div>
-          <input ref={fileRef} type="file" accept=".epub" style={{ display: 'none' }} onChange={e => openFile(e.target.files[0])} />
-          <div style={{ fontSize: 11, opacity: .35, textAlign: 'center' }}>Files stay on your device · Works offline</div>
         </div>
-      ) : (
+      )}
+
+      {/* ── Reading view ── */}
+      {book ? (
         <>
           <div ref={contentRef} className="chapter-content" style={S.content}
             dangerouslySetInnerHTML={{ __html: sanitizeHtml(chapter?.html || '') }} />
           <div style={S.bottomBar}>
-            <button style={S.navBtn(chapterIndex === 0)} disabled={chapterIndex === 0}
-              onClick={() => setChapterIndex(i => Math.max(0, i-1))}>← Prev</button>
+            <button style={S.navBtn(chapterIndex===0)} disabled={chapterIndex===0}
+              onClick={() => setChapterIndex(i => Math.max(0,i-1))}>← Prev</button>
             <div style={S.chLabel}>{chapter?.label}</div>
-            <button style={S.navBtn(chapterIndex === book.chapters.length-1)} disabled={chapterIndex === book.chapters.length-1}
-              onClick={() => setChapterIndex(i => Math.min(book.chapters.length-1, i+1))}>Next →</button>
+            <button style={S.navBtn(chapterIndex===book.chapters.length-1)} disabled={chapterIndex===book.chapters.length-1}
+              onClick={() => setChapterIndex(i => Math.min(book.chapters.length-1,i+1))}>Next →</button>
           </div>
         </>
+      ) : (
+        /* ── Library view ── */
+        <div style={S.libWrap}>
+          <div style={S.libHeader}>
+            <div>
+              <div style={S.libTitle}>📚 EPUB Reader</div>
+              <div style={{ fontSize:12, opacity:.4, marginTop:2 }}>{library.length} {library.length===1?'book':'books'} saved</div>
+            </div>
+            <div style={S.themeRow}>
+              {Object.keys(THEMES).map(n => <button key={n} style={S.thCircle(n)} onClick={() => setTheme(n)} title={n} />)}
+            </div>
+          </div>
+
+          <button style={S.addBtn} onClick={() => fileRef.current?.click()}>
+            <span style={{ fontSize:18, lineHeight:1 }}>+</span> Add EPUB Book
+          </button>
+          <input ref={fileRef} type="file" accept=".epub" style={{ display:'none' }}
+            onChange={e => { openFile(e.target.files[0]); e.target.value=''; }} />
+
+          {loading && (
+            <div style={{ textAlign:'center', padding:24, color:t.accent, fontSize:14 }}>
+              {loadingMsg || 'Loading…'}
+            </div>
+          )}
+          {error && (
+            <div style={{ background:'#fdecea', border:'1px solid #f5c6cb', borderRadius:12, padding:'12px 16px', marginBottom:12, color:'#a93226', fontSize:13 }}>
+              {error}
+            </div>
+          )}
+
+          {!loading && library.length === 0 && !error && (
+            <div style={S.emptyState}>
+              <div style={{ fontSize:56 }}>📖</div>
+              <div style={{ fontSize:16, fontWeight:600 }}>No books yet</div>
+              <div style={{ fontSize:13 }}>Tap "Add EPUB Book" to get started</div>
+            </div>
+          )}
+
+          {library.map(b => (
+            <div key={b.id} className="book-card" style={S.bookCard}>
+              <div style={S.bookSpine} onClick={() => openFromLibrary(b.id)}>📖</div>
+              <div style={S.bookInfo} onClick={() => openFromLibrary(b.id)}>
+                <div style={S.bookTitle}>{b.title}</div>
+                <div style={S.bookAuthor}>{b.author}</div>
+              </div>
+              <button style={S.delBtn} onClick={() => setConfirmDelete(b.id)} title="Remove">🗑</button>
+            </div>
+          ))}
+
+          <div style={{ fontSize:11, opacity:.28, textAlign:'center', marginTop:20 }}>
+            Books stored on your device · Works offline
+          </div>
+        </div>
       )}
     </div>
   );
@@ -306,11 +421,10 @@ ReactDOM.createRoot(document.getElementById('root')).render(<App />);
 </script>
 
 <script>
-  // Register service worker for offline support
   if ('serviceWorker' in navigator) {
     window.addEventListener('load', () => {
       navigator.serviceWorker.register('./sw.js')
-        .then(r => console.log('SW registered:', r.scope))
+        .then(r => console.log('SW:', r.scope))
         .catch(e => console.warn('SW failed:', e));
     });
   }

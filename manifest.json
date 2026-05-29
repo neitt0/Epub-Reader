@@ -1,6 +1,6 @@
 {
-  "name": "Folio – EPUB Reader",
-  "short_name": "Folio",
+  "name": "EPUB Reader",
+  "short_name": "EPUB Reader",
   "description": "A clean, offline EPUB reader for your phone",
   "start_url": "./index.html",
   "display": "standalone",
