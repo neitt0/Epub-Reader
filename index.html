@@ -23,7 +23,6 @@
     .chapter-content blockquote { border-left:3px solid currentColor; margin:1em 0; padding-left:1em; opacity:.75; }
     .chapter-content table { width:100%; border-collapse:collapse; margin:1em 0; font-size:.9em; }
     .chapter-content td,.chapter-content th { border:1px solid rgba(0,0,0,.15); padding:6px 10px; }
-    .book-card:active { opacity: 0.7; }
   </style>
 </head>
 <body>
@@ -36,17 +35,15 @@
 <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.min.js"></script>
 
 <script type="text/babel">
-const { useState, useEffect, useRef, useCallback, useMemo } = React;
+const { useState, useEffect, useRef, useCallback } = React;
 
-// ─────────────────────────────────────────────────────────────────────────────
-// STEP 1: Paste your Supabase Project URL and Anon Key here
-// (see README / setup instructions below)
-// ─────────────────────────────────────────────────────────────────────────────
 const SUPABASE_URL      = 'https://equggcrzqijjvxgnfzlo.supabase.co';
 const SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImVxdWdnY3J6cWlqanZ4Z25memxvIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODAwNzYxNjUsImV4cCI6MjA5NTY1MjE2NX0.0jtp8Wn3IsnPViC8YSTRS9tF_80ZdBzJxVhjxXcMY4M';
-// ─────────────────────────────────────────────────────────────────────────────
+const BUCKET = 'epubs';
 
-const IS_CONFIGURED = SUPABASE_URL !== 'YOUR_SUPABASE_URL';
+const sb = supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
+  auth: { persistSession: true, autoRefreshToken: true }
+});
 
 const FONT_SIZES = [14, 16, 18, 20, 24];
 const THEMES = {
@@ -54,63 +51,6 @@ const THEMES = {
   sepia: { bg:'#F4ECD8', text:'#3B2F1E', surface:'#EAE0CA', accent:'#7A5C38', border:'#D4C4A8', card:'#E4D8C0' },
   dark:  { bg:'#1A1814', text:'#E8E0D0', surface:'#252219', accent:'#C4956A', border:'#3A362E', card:'#2E2A24' },
 };
-
-// ── Supabase client (only if configured) ────────────────────────────────────
-const sb = IS_CONFIGURED ? supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY) : null;
-const BUCKET = 'epubs';
-
-// Each device gets a stable UUID stored in localStorage
-function getDeviceId() {
-  let id = localStorage.getItem('epub_device_id');
-  if (!id) {
-    id = 'dev_' + Date.now() + '_' + Math.random().toString(36).slice(2, 8);
-    localStorage.setItem('epub_device_id', id);
-  }
-  return id;
-}
-
-// ── Supabase helpers ──────────────────────────────────────────────────────────
-async function sbGetLibrary() {
-  const { data, error } = await sb.from('books')
-    .select('id, title, author, file_path, created_at')
-    .eq('device_id', getDeviceId())
-    .order('created_at', { ascending: false });
-  if (error) throw error;
-  return data || [];
-}
-
-async function sbUploadBook(arrayBuffer, metadata) {
-  const deviceId = getDeviceId();
-  const bookId   = 'book_' + Date.now();
-  const filePath = `${deviceId}/${bookId}.epub`;
-
-  // 1. Upload file to Storage
-  const { error: upErr } = await sb.storage.from(BUCKET)
-    .upload(filePath, arrayBuffer, { contentType: 'application/epub+zip', upsert: false });
-  if (upErr) throw new Error('Upload failed: ' + upErr.message);
-
-  // 2. Save metadata to books table
-  const { error: dbErr } = await sb.from('books')
-    .insert({ id: bookId, device_id: deviceId, title: metadata.title, author: metadata.author, file_path: filePath });
-  if (dbErr) {
-    // Clean up orphaned file if DB insert fails
-    await sb.storage.from(BUCKET).remove([filePath]).catch(() => {});
-    throw new Error('Save failed: ' + dbErr.message);
-  }
-
-  return { id: bookId, file_path: filePath };
-}
-
-async function sbDownloadBook(filePath) {
-  const { data, error } = await sb.storage.from(BUCKET).download(filePath);
-  if (error) throw new Error('Download failed: ' + error.message);
-  return await data.arrayBuffer();
-}
-
-async function sbDeleteBook(id, filePath) {
-  await sb.storage.from(BUCKET).remove([filePath]);
-  await sb.from('books').delete().eq('id', id);
-}
 
 // ── EPUB parsing ──────────────────────────────────────────────────────────────
 function qsAll(doc, name) {
@@ -125,34 +65,28 @@ function getDcText(doc, name) {
   const els = doc.getElementsByTagNameNS('http://purl.org/dc/elements/1.1/', name);
   return els[0]?.textContent.trim() || null;
 }
-
 async function parseEpub(arrayBuffer, fileName) {
-  const zip  = new JSZip();
+  const zip = new JSZip();
   const epub = await zip.loadAsync(arrayBuffer);
   const parser = new DOMParser();
-
   const containerXml = await epub.file('META-INF/container.xml')?.async('text');
   if (!containerXml) throw new Error('Invalid EPUB: no container.xml');
   const opfPath = qs(parser.parseFromString(containerXml,'application/xml'),'rootfile')?.getAttribute('full-path');
   if (!opfPath) throw new Error('Invalid EPUB: no OPF path');
-
   const opfText = await epub.file(opfPath)?.async('text');
   if (!opfText) throw new Error('Invalid EPUB: no OPF file');
   const opfDoc = parser.parseFromString(opfText,'application/xml');
   const opfDir = opfPath.includes('/') ? opfPath.substring(0, opfPath.lastIndexOf('/')+1) : '';
-
   const manifest = {};
   qsAll(opfDoc,'item').forEach(el => {
     manifest[el.getAttribute('id')] = { href: el.getAttribute('href'), mediaType: el.getAttribute('media-type') };
   });
-
   const spineEl = qs(opfDoc,'spine');
   const spineItems = [];
   qsAll(opfDoc,'itemref').forEach(ref => {
     const id = ref.getAttribute('idref');
     if (manifest[id]) spineItems.push({ id, ...manifest[id] });
   });
-
   let toc = [];
   const ncxEntry = (spineEl?.getAttribute('toc') && manifest[spineEl.getAttribute('toc')]) ||
     Object.values(manifest).find(m => m.mediaType === 'application/x-dtbncx+xml');
@@ -162,15 +96,13 @@ async function parseEpub(arrayBuffer, fileName) {
       const ncxDoc = parser.parseFromString(await ncxFile.async('text'),'application/xml');
       Array.from(ncxDoc.getElementsByTagNameNS('*','navPoint')).forEach(np => {
         const label = np.getElementsByTagNameNS('*','text')[0]?.textContent?.trim() || 'Chapter';
-        const src   = np.getElementsByTagNameNS('*','content')[0]?.getAttribute('src') || '';
+        const src = np.getElementsByTagNameNS('*','content')[0]?.getAttribute('src') || '';
         toc.push({ label, href: src.split('#')[0] });
       });
     }
   }
-
   const title  = getDcText(opfDoc,'title')   || fileName.replace(/\.epub$/i,'');
   const author = getDcText(opfDoc,'creator') || 'Unknown Author';
-
   const chapters = [];
   for (let i = 0; i < spineItems.length; i++) {
     const item = spineItems[i];
@@ -183,56 +115,78 @@ async function parseEpub(arrayBuffer, fileName) {
   if (!chapters.length) throw new Error('No readable chapters found.');
   return { title, author, chapters };
 }
-
 function sanitizeHtml(html) {
   const doc = new DOMParser().parseFromString(html,'text/html');
   doc.querySelectorAll('script,style,link').forEach(el => el.remove());
   doc.querySelectorAll('[style]').forEach(el => el.removeAttribute('style'));
   return doc.body?.innerHTML || '';
 }
-
 function savePos(id, idx) { try { localStorage.setItem('pos_'+id, idx); } catch(_) {} }
 function loadPos(id)      { try { return parseInt(localStorage.getItem('pos_'+id))||0; } catch(_) { return 0; } }
 
-// ── Setup screen ─────────────────────────────────────────────────────────────
-function SetupScreen({ t }) {
+// ── Login Screen ──────────────────────────────────────────────────────────────
+function LoginScreen({ t }) {
+  const [email, setEmail]     = useState('');
+  const [sent, setSent]       = useState(false);
+  const [loading, setLoading] = useState(false);
+  const [error, setError]     = useState(null);
+
+  const sendLink = async () => {
+    if (!email.includes('@')) { setError('Enter a valid email.'); return; }
+    setLoading(true); setError(null);
+    const { error: e } = await sb.auth.signInWithOtp({
+      email,
+      options: { emailRedirectTo: window.location.href }
+    });
+    if (e) { setError(e.message); setLoading(false); return; }
+    setSent(true); setLoading(false);
+  };
+
+  const S = {
+    wrap:    { flex:1, display:'flex', flexDirection:'column', alignItems:'center', justifyContent:'center', padding:32, gap:16 },
+    box:     { width:'100%', maxWidth:360, background:t.card, borderRadius:24, padding:32, display:'flex', flexDirection:'column', gap:14 },
+    title:   { fontSize:26, fontWeight:700, textAlign:'center', marginBottom:4 },
+    sub:     { fontSize:14, opacity:.5, textAlign:'center', lineHeight:1.5, marginBottom:8 },
+    input:   { width:'100%', padding:'13px 16px', borderRadius:14, border:`1.5px solid ${t.border}`, background:t.bg, color:t.text, fontSize:15, fontFamily:'inherit', outline:'none' },
+    btn:     { width:'100%', padding:'13px', borderRadius:14, background:t.accent, color:'#fff', border:'none', fontSize:15, fontWeight:700, cursor:'pointer', fontFamily:'inherit' },
+    error:   { fontSize:13, color:'#c0392b', textAlign:'center' },
+    success: { fontSize:14, textAlign:'center', lineHeight:1.6, opacity:.7 },
+  };
+
   return (
-    <div style={{ flex:1, overflowY:'auto', padding:'32px 20px', maxWidth:560, margin:'0 auto', lineHeight:1.7 }}>
-      <div style={{ fontSize:28, marginBottom:4 }}>📖 EPUB Reader</div>
-      <div style={{ fontSize:14, opacity:.5, marginBottom:28 }}>One-time setup needed</div>
-
-      {[
-        { n:'1', title:'Go to supabase.com', body: 'Click "Start your project" and sign in with your GitHub account.' },
-        { n:'2', title:'Create a new project', body: 'Click "New project", give it any name (e.g. epub-reader), pick any region, and click "Create new project". Wait about 1 minute.' },
-        { n:'3', title:'Create the books table', body: 'In the left sidebar click "SQL Editor", paste the code below, and click "Run".' },
-        { n:'4', title:'Create the storage bucket', body: 'In the left sidebar click "Storage" → "New bucket". Name it epubs, check "Public bucket", click Save.' },
-        { n:'5', title:'Get your keys', body: 'In the left sidebar click "Project Settings" → "API". Copy the "Project URL" and the "anon public" key.' },
-        { n:'6', title:'Paste keys into index.html', body: 'Open index.html, find the two lines near the top that say YOUR_SUPABASE_URL and YOUR_SUPABASE_ANON_KEY, and replace them with your copied values. Upload to GitHub.' },
-      ].map(step => (
-        <div key={step.n} style={{ display:'flex', gap:14, marginBottom:20 }}>
-          <div style={{ width:28, height:28, borderRadius:'50%', background:t.accent, color:'#fff', display:'flex', alignItems:'center', justifyContent:'center', fontSize:13, fontWeight:700, flexShrink:0, marginTop:2 }}>{step.n}</div>
-          <div>
-            <div style={{ fontWeight:700, fontSize:15, marginBottom:3 }}>{step.title}</div>
-            <div style={{ fontSize:13, opacity:.65 }}>{step.body}</div>
-          </div>
-        </div>
-      ))}
-
-      <div style={{ background:t.card, borderRadius:12, padding:'14px 16px', marginTop:8, marginBottom:8 }}>
-        <div style={{ fontSize:11, fontWeight:700, letterSpacing:'.08em', opacity:.45, textTransform:'uppercase', marginBottom:8 }}>SQL to run in Step 3</div>
-        <pre style={{ fontSize:12, overflowX:'auto', lineHeight:1.6, color:t.text, opacity:.8 }}>{`create table books (
-  id text primary key,
-  device_id text not null,
-  title text,
-  author text,
-  file_path text,
-  created_at timestamptz default now()
-);
-alter table books disable row level security;`}</pre>
-      </div>
-
-      <div style={{ fontSize:12, opacity:.4, marginTop:16, textAlign:'center' }}>
-        Supabase free tier includes 1 GB file storage — enough for hundreds of books
+    <div style={S.wrap}>
+      <div style={S.box}>
+        <div style={S.title}>📖 EPUB Reader</div>
+        {sent ? (
+          <>
+            <div style={{ fontSize:48, textAlign:'center' }}>📬</div>
+            <div style={S.success}>
+              Check your email for a magic link.<br/>
+              Tap it to sign in — no password needed.
+            </div>
+            <button style={{ ...S.btn, background:'transparent', color:t.accent, border:`1px solid ${t.accent}` }}
+              onClick={() => setSent(false)}>← Use different email</button>
+          </>
+        ) : (
+          <>
+            <div style={S.sub}>Sign in with your email to save your library across all your devices.</div>
+            <input
+              style={S.input}
+              type="email"
+              placeholder="your@email.com"
+              value={email}
+              onChange={e => setEmail(e.target.value)}
+              onKeyDown={e => e.key === 'Enter' && sendLink()}
+            />
+            {error && <div style={S.error}>{error}</div>}
+            <button style={S.btn} onClick={sendLink} disabled={loading}>
+              {loading ? 'Sending…' : 'Send Magic Link'}
+            </button>
+            <div style={{ fontSize:11, opacity:.35, textAlign:'center' }}>
+              No password needed · Just tap the link in your email
+            </div>
+          </>
+        )}
       </div>
     </div>
   );
@@ -240,6 +194,8 @@ alter table books disable row level security;`}</pre>
 
 // ── Main App ──────────────────────────────────────────────────────────────────
 function App() {
+  const [user, setUser]                   = useState(null);
+  const [authLoading, setAuthLoading]     = useState(true);
   const [library, setLibrary]             = useState([]);
   const [book, setBook]                   = useState(null);
   const [chapterIndex, setChapterIndex]   = useState(0);
@@ -258,19 +214,39 @@ function App() {
   const fs = FONT_SIZES[fontIdx];
   const progress = book ? Math.round(((chapterIndex+1)/book.chapters.length)*100) : 0;
 
+  // ── Auth listener ──────────────────────────────────────────────────────────
+  useEffect(() => {
+    sb.auth.getSession().then(({ data }) => {
+      setUser(data.session?.user ?? null);
+      setAuthLoading(false);
+    });
+    const { data: { subscription } } = sb.auth.onAuthStateChange((_event, session) => {
+      setUser(session?.user ?? null);
+      setAuthLoading(false);
+    });
+    return () => subscription.unsubscribe();
+  }, []);
+
+  // ── Load library when user logs in ────────────────────────────────────────
+  useEffect(() => {
+    if (!user) { setLibrary([]); return; }
+    setLoading(true); setLoadingMsg('Loading library…');
+    sb.from('books')
+      .select('id, title, author, file_path, created_at')
+      .eq('device_id', user.id)
+      .order('created_at', { ascending: false })
+      .then(({ data, error: e }) => {
+        if (e) { setError('Could not load library: ' + e.message); }
+        else    { setLibrary(data || []); }
+      })
+      .finally(() => { setLoading(false); setLoadingMsg(''); });
+  }, [user]);
+
   useEffect(() => { localStorage.setItem('epub_theme', theme); }, [theme]);
   useEffect(() => { contentRef.current?.scrollTo(0,0); }, [chapterIndex]);
   useEffect(() => { if (book) savePos(book.id, chapterIndex); }, [book, chapterIndex]);
 
-  useEffect(() => {
-    if (!IS_CONFIGURED) return;
-    setLoading(true); setLoadingMsg('Loading library…');
-    sbGetLibrary()
-      .then(rows => setLibrary(rows))
-      .catch(e => setError('Could not load library: ' + e.message))
-      .finally(() => { setLoading(false); setLoadingMsg(''); });
-  }, []);
-
+  // ── Upload new book ────────────────────────────────────────────────────────
   const openFile = useCallback(async (file) => {
     if (!file?.name.toLowerCase().endsWith('.epub')) { setError('Please choose a .epub file.'); return; }
     setLoading(true); setError(null); setLoadingMsg('Reading file…');
@@ -279,7 +255,7 @@ function App() {
       setLoadingMsg('Parsing book…');
       const parsed = await parseEpub(arrayBuffer, file.name);
 
-      // Check if already saved (same title + author)
+      // Already in library?
       const existing = library.find(b => b.title === parsed.title && b.author === parsed.author);
       if (existing) {
         setBook({ ...existing, chapters: parsed.chapters });
@@ -287,46 +263,63 @@ function App() {
         return;
       }
 
-      setLoadingMsg('Uploading to cloud… (may take a moment)');
-      const { id, file_path } = await sbUploadBook(arrayBuffer, parsed);
-      const newEntry = { id, title: parsed.title, author: parsed.author, file_path };
+      setLoadingMsg('Uploading to cloud…');
+      const bookId   = 'book_' + Date.now();
+      const filePath = `${user.id}/${bookId}.epub`;
+
+      const { error: upErr } = await sb.storage.from(BUCKET)
+        .upload(filePath, arrayBuffer, { contentType:'application/epub+zip', upsert:false });
+      if (upErr) throw new Error('Upload failed: ' + upErr.message);
+
+      const { error: dbErr } = await sb.from('books')
+        .insert({ id:bookId, device_id:user.id, title:parsed.title, author:parsed.author, file_path:filePath });
+      if (dbErr) {
+        await sb.storage.from(BUCKET).remove([filePath]).catch(()=>{});
+        throw new Error('Save failed: ' + dbErr.message);
+      }
+
+      const newEntry = { id:bookId, title:parsed.title, author:parsed.author, file_path:filePath };
       setLibrary(lib => [newEntry, ...lib]);
       setBook({ ...newEntry, chapters: parsed.chapters });
       setChapterIndex(0);
-    } catch(e) {
-      setError(e.message);
-    } finally { setLoading(false); setLoadingMsg(''); }
-  }, [library]);
+    } catch(e) { setError(e.message); }
+    finally { setLoading(false); setLoadingMsg(''); }
+  }, [library, user]);
 
+  // ── Open saved book ────────────────────────────────────────────────────────
   const openFromLibrary = useCallback(async (entry) => {
     setLoading(true); setError(null); setLoadingMsg('Downloading book…');
     try {
-      const arrayBuffer = await sbDownloadBook(entry.file_path);
+      const { data, error: e } = await sb.storage.from(BUCKET).download(entry.file_path);
+      if (e) throw new Error('Download failed: ' + e.message);
       setLoadingMsg('Parsing chapters…');
-      const parsed = await parseEpub(arrayBuffer, entry.title);
+      const parsed = await parseEpub(await data.arrayBuffer(), entry.title);
       setBook({ ...entry, chapters: parsed.chapters });
       setChapterIndex(loadPos(entry.id));
-    } catch(e) {
-      setError(e.message);
-    } finally { setLoading(false); setLoadingMsg(''); }
+    } catch(e) { setError(e.message); }
+    finally { setLoading(false); setLoadingMsg(''); }
   }, []);
 
+  // ── Delete book ────────────────────────────────────────────────────────────
   const deleteBook = useCallback(async (entry) => {
+    setConfirmDelete(null);
     try {
-      await sbDeleteBook(entry.id, entry.file_path);
+      await sb.storage.from(BUCKET).remove([entry.file_path]);
+      await sb.from('books').delete().eq('id', entry.id);
       localStorage.removeItem('pos_' + entry.id);
       setLibrary(lib => lib.filter(b => b.id !== entry.id));
+      if (book?.id === entry.id) setBook(null);
     } catch(e) { setError('Delete failed: ' + e.message); }
-    finally { setConfirmDelete(null); }
-  }, []);
+  }, [book]);
 
   const chapter = book?.chapters[chapterIndex];
 
+  // ── Styles ─────────────────────────────────────────────────────────────────
   const S = {
     app:        { fontFamily:"Georgia,'Times New Roman',serif", minHeight:'100dvh', background:t.bg, color:t.text, display:'flex', flexDirection:'column', transition:'background .3s,color .3s' },
-    bar:        { display:'flex', alignItems:'center', gap:8, padding:'10px 14px', background:t.surface, borderBottom:`1px solid ${t.border}`, position:'sticky', top:0, zIndex:100 },
+    bar:        { display:'flex', alignItems:'center', gap:8, padding:'10px 14px', background:t.surface, borderBottom:`1px solid ${t.border}`, position:'sticky', top:0, zIndex:100, flexShrink:0 },
     iBtn:       { background:'none', border:'none', cursor:'pointer', color:t.accent, padding:6, borderRadius:8, fontSize:22, lineHeight:1, display:'flex', alignItems:'center', justifyContent:'center', minWidth:36, minHeight:36 },
-    prog:       { height:3, background:t.border },
+    prog:       { height:3, background:t.border, flexShrink:0 },
     progFill:   { height:'100%', background:t.accent, width:progress+'%', transition:'width .4s ease' },
     content:    { flex:1, overflowY:'auto', WebkitOverflowScrolling:'touch', padding:'28px 20px 90px', maxWidth:680, width:'100%', margin:'0 auto', fontSize:fs, lineHeight:1.85, color:t.text },
     bottomBar:  { position:'fixed', bottom:0, left:0, right:0, display:'flex', alignItems:'center', gap:8, padding:'10px 16px', paddingBottom:'max(10px, env(safe-area-inset-bottom))', background:t.surface, borderTop:`1px solid ${t.border}`, zIndex:100 },
@@ -339,40 +332,58 @@ function App() {
     settBox:    { position:'fixed', top:54, right:10, background:t.surface, border:`1px solid ${t.border}`, borderRadius:16, padding:16, zIndex:160, width:210, boxShadow:'0 8px 32px rgba(0,0,0,.22)' },
     setLabel:   { fontSize:10, fontWeight:700, letterSpacing:'.1em', opacity:.45, textTransform:'uppercase', marginBottom:8 },
     thCircle:   (n) => ({ width:30, height:30, borderRadius:'50%', border:theme===n?`2.5px solid ${t.accent}`:`2px solid ${t.border}`, background:THEMES[n].bg, cursor:'pointer' }),
-    libWrap:    { flex:1, display:'flex', flexDirection:'column', padding:'20px 16px 100px' },
-    libHeader:  { display:'flex', alignItems:'center', justifyContent:'space-between', marginBottom:20 },
-    libTitle:   { fontSize:22, fontWeight:700 },
-    addBtn:     { display:'flex', alignItems:'center', justifyContent:'center', gap:8, background:t.accent, color:'#fff', border:'none', borderRadius:16, padding:'13px 20px', fontSize:14, fontWeight:600, cursor:'pointer', fontFamily:'inherit', marginBottom:16, width:'100%' },
-    bookCard:   { display:'flex', alignItems:'center', gap:12, background:t.card, borderRadius:14, padding:'14px 16px', marginBottom:10, cursor:'pointer' },
-    bookSpine:  { width:40, height:54, borderRadius:6, background:t.accent, flexShrink:0, display:'flex', alignItems:'center', justifyContent:'center', fontSize:20 },
+    libWrap:    { flex:1, overflowY:'auto', WebkitOverflowScrolling:'touch', display:'flex', flexDirection:'column', padding:'20px 16px', paddingBottom:'max(20px, env(safe-area-inset-bottom))' },
+    libHeader:  { display:'flex', alignItems:'flex-start', justifyContent:'space-between', marginBottom:20, gap:12 },
+    addBtn:     { display:'flex', alignItems:'center', justifyContent:'center', gap:8, background:t.accent, color:'#fff', border:'none', borderRadius:16, padding:'14px 20px', fontSize:15, fontWeight:700, cursor:'pointer', fontFamily:'inherit', marginBottom:16, width:'100%', flexShrink:0 },
+    bookCard:   { display:'flex', alignItems:'center', gap:12, background:t.card, borderRadius:14, padding:'14px 16px', marginBottom:10, cursor:'pointer', flexShrink:0 },
+    bookSpine:  { width:44, height:58, borderRadius:7, background:t.accent, flexShrink:0, display:'flex', alignItems:'center', justifyContent:'center', fontSize:22 },
     bookInfo:   { flex:1, overflow:'hidden' },
-    bookTitle:  { fontSize:14, fontWeight:600, overflow:'hidden', textOverflow:'ellipsis', whiteSpace:'nowrap', marginBottom:2 },
+    bookTitle:  { fontSize:14, fontWeight:600, overflow:'hidden', textOverflow:'ellipsis', whiteSpace:'nowrap', marginBottom:3 },
     bookAuthor: { fontSize:12, opacity:.55, overflow:'hidden', textOverflow:'ellipsis', whiteSpace:'nowrap' },
-    delBtn:     { background:'none', border:'none', cursor:'pointer', color:'#c0392b', fontSize:20, padding:'4px 6px', borderRadius:8, flexShrink:0 },
-    emptyState: { flex:1, display:'flex', flexDirection:'column', alignItems:'center', justifyContent:'center', gap:12, opacity:.4, textAlign:'center', padding:40 },
+    delBtn:     { background:'none', border:'none', cursor:'pointer', color:'#c0392b', fontSize:22, padding:'6px 8px', borderRadius:8, flexShrink:0, lineHeight:1 },
+    emptyState: { flex:1, display:'flex', flexDirection:'column', alignItems:'center', justifyContent:'center', gap:12, opacity:.35, textAlign:'center', padding:40 },
     modal:      { position:'fixed', inset:0, background:'rgba(0,0,0,.55)', zIndex:300, display:'flex', alignItems:'center', justifyContent:'center', padding:24 },
     modalBox:   { background:t.surface, borderRadius:20, padding:24, width:'100%', maxWidth:320 },
-    modalTitle: { fontSize:16, fontWeight:700, marginBottom:8 },
-    modalText:  { fontSize:14, opacity:.65, marginBottom:20, lineHeight:1.5 },
-    modalBtns:  { display:'flex', gap:10 },
-    cancelBtn:  { flex:1, background:'transparent', border:`1px solid ${t.border}`, borderRadius:12, padding:'10px', fontSize:13, fontWeight:600, cursor:'pointer', fontFamily:'inherit', color:t.text },
-    confirmBtn: { flex:1, background:'#c0392b', border:'none', borderRadius:12, padding:'10px', fontSize:13, fontWeight:600, cursor:'pointer', fontFamily:'inherit', color:'#fff' },
+    modalBtns:  { display:'flex', gap:10, marginTop:20 },
+    cancelBtn:  { flex:1, background:'transparent', border:`1px solid ${t.border}`, borderRadius:12, padding:'11px', fontSize:13, fontWeight:600, cursor:'pointer', fontFamily:'inherit', color:t.text },
+    confirmBtn: { flex:1, background:'#c0392b', border:'none', borderRadius:12, padding:'11px', fontSize:13, fontWeight:600, cursor:'pointer', fontFamily:'inherit', color:'#fff' },
   };
 
+  // Auth loading splash
+  if (authLoading) {
+    return (
+      <div style={{...S.app, alignItems:'center', justifyContent:'center', gap:12}}>
+        <div style={{fontSize:48}}>📖</div>
+        <div style={{fontSize:14, opacity:.4}}>Loading…</div>
+      </div>
+    );
+  }
+
+  // Not logged in
+  if (!user) {
+    return (
+      <div style={S.app}>
+        <LoginScreen t={t} />
+      </div>
+    );
+  }
+
   return (
-    <div style={S.app} onDrop={e=>{e.preventDefault();if(!book&&IS_CONFIGURED)openFile(e.dataTransfer.files[0]);}} onDragOver={e=>e.preventDefault()}>
+    <div style={S.app}
+      onDrop={e=>{e.preventDefault();if(!book)openFile(e.dataTransfer.files[0]);}}
+      onDragOver={e=>e.preventDefault()}>
 
       {/* Top bar — reading mode */}
       {book && (
         <div style={S.bar}>
-          <button style={S.iBtn} onClick={() => setShowSidebar(true)}>☰</button>
+          <button style={S.iBtn} onClick={()=>setShowSidebar(true)}>☰</button>
           <div style={{flex:1,textAlign:'center',fontSize:13,fontWeight:600,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}>{book.title}</div>
-          <button style={S.iBtn} onClick={() => setShowSettings(s=>!s)}>⚙</button>
+          <button style={S.iBtn} onClick={()=>setShowSettings(s=>!s)}>⚙</button>
         </div>
       )}
       {book && <div style={S.prog}><div style={S.progFill}/></div>}
 
-      {/* Settings */}
+      {/* Settings panel */}
       {showSettings && book && (
         <div style={S.settBox}>
           <div style={S.setLabel}>Font Size</div>
@@ -407,12 +418,12 @@ function App() {
         ))}
       </div>
 
-      {/* Delete modal */}
+      {/* Delete confirm modal */}
       {confirmDelete && (
         <div style={S.modal}>
           <div style={S.modalBox}>
-            <div style={S.modalTitle}>Remove book?</div>
-            <div style={S.modalText}>This deletes it from your cloud library. You can always re-upload it.</div>
+            <div style={{fontSize:16,fontWeight:700,marginBottom:8}}>Remove "{confirmDelete.title}"?</div>
+            <div style={{fontSize:14,opacity:.6,lineHeight:1.5}}>This deletes it from your library. You can always re-upload it.</div>
             <div style={S.modalBtns}>
               <button style={S.cancelBtn} onClick={()=>setConfirmDelete(null)}>Cancel</button>
               <button style={S.confirmBtn} onClick={()=>deleteBook(confirmDelete)}>Remove</button>
@@ -434,27 +445,32 @@ function App() {
               onClick={()=>setChapterIndex(i=>Math.min(book.chapters.length-1,i+1))}>Next →</button>
           </div>
         </>
-      ) : !IS_CONFIGURED ? (
-        <SetupScreen t={t}/>
       ) : (
         /* Library view */
         <div style={S.libWrap}>
+          {/* Header */}
           <div style={S.libHeader}>
             <div>
-              <div style={S.libTitle}>📚 EPUB Reader</div>
-              <div style={{fontSize:12,opacity:.4,marginTop:2}}>{library.length} {library.length===1?'book':'books'}</div>
+              <div style={{fontSize:22,fontWeight:700}}>📚 My Library</div>
+              <div style={{fontSize:12,opacity:.4,marginTop:2}}>{user.email}</div>
             </div>
-            <div style={{display:'flex',gap:8}}>
-              {Object.keys(THEMES).map(n=><button key={n} style={S.thCircle(n)} onClick={()=>setTheme(n)} title={n}/>)}
+            <div style={{display:'flex',flexDirection:'column',alignItems:'flex-end',gap:8}}>
+              <div style={{display:'flex',gap:8}}>
+                {Object.keys(THEMES).map(n=><button key={n} style={S.thCircle(n)} onClick={()=>setTheme(n)} title={n}/>)}
+              </div>
+              <button style={{background:'none',border:'none',cursor:'pointer',color:t.text,opacity:.4,fontSize:12,fontFamily:'inherit'}}
+                onClick={()=>sb.auth.signOut()}>Sign out</button>
             </div>
           </div>
 
+          {/* Add book button — always visible */}
           <button style={S.addBtn} onClick={()=>fileRef.current?.click()}>
-            <span style={{fontSize:18}}>+</span> Add EPUB Book
+            <span style={{fontSize:20,lineHeight:1}}>＋</span> Add EPUB Book
           </button>
           <input ref={fileRef} type="file" accept=".epub" style={{display:'none'}}
             onChange={e=>{openFile(e.target.files[0]);e.target.value='';}}/>
 
+          {/* Loading / error states */}
           {loading && (
             <div style={{textAlign:'center',padding:24,color:t.accent,fontSize:14}}>
               {loadingMsg||'Loading…'}
@@ -463,30 +479,33 @@ function App() {
           {error && (
             <div style={{background:'#fdecea',border:'1px solid #f5c6cb',borderRadius:12,padding:'12px 16px',marginBottom:12,color:'#a93226',fontSize:13}}>
               {error}
+              <button style={{marginLeft:12,background:'none',border:'none',cursor:'pointer',color:'#a93226',fontSize:13}} onClick={()=>setError(null)}>✕</button>
             </div>
           )}
 
+          {/* Empty state */}
           {!loading && library.length===0 && !error && (
             <div style={S.emptyState}>
               <div style={{fontSize:56}}>📖</div>
               <div style={{fontSize:16,fontWeight:600}}>No books yet</div>
-              <div style={{fontSize:13}}>Tap "Add EPUB Book" to get started</div>
+              <div style={{fontSize:13}}>Tap the button above to add your first book</div>
             </div>
           )}
 
+          {/* Book list */}
           {library.map(b=>(
-            <div key={b.id} className="book-card" style={S.bookCard}>
+            <div key={b.id} style={S.bookCard}>
               <div style={S.bookSpine} onClick={()=>openFromLibrary(b)}>📖</div>
               <div style={S.bookInfo} onClick={()=>openFromLibrary(b)}>
                 <div style={S.bookTitle}>{b.title}</div>
                 <div style={S.bookAuthor}>{b.author}</div>
               </div>
-              <button style={S.delBtn} onClick={()=>setConfirmDelete(b)}>🗑</button>
+              <button style={S.delBtn} onClick={()=>setConfirmDelete(b)} title="Remove book">🗑</button>
             </div>
           ))}
 
-          <div style={{fontSize:11,opacity:.28,textAlign:'center',marginTop:20}}>
-            Books stored in the cloud · Available on any device
+          <div style={{fontSize:11,opacity:.25,textAlign:'center',marginTop:'auto',paddingTop:24}}>
+            Books saved to cloud · Access from any device
           </div>
         </div>
       )}
@@ -496,12 +515,9 @@ function App() {
 
 ReactDOM.createRoot(document.getElementById('root')).render(<App/>);
 </script>
-
 <script>
   if ('serviceWorker' in navigator) {
-    window.addEventListener('load', () => {
-      navigator.serviceWorker.register('./sw.js').catch(()=>{});
-    });
+    window.addEventListener('load', () => navigator.serviceWorker.register('./sw.js').catch(()=>{}));
   }
 </script>
 </body>
